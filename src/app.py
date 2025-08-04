@@ -18,31 +18,32 @@ import re
 # Initialize LLM model and tokenizer
 @st.cache_resource
 def load_llm_model():
-    """Load the Phi-3 model and tokenizer from Hugging Face"""
-    model_name = "microsoft/Phi-3-mini-4k-instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    """Load the Mistral-7B-Instruct model and tokenizer from Hugging Face"""
+    model_name = "mistralai/Mistral-7B-Instruct-v0.2"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    # Add padding token if not present
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True
+        low_cpu_mem_usage=True
     )
     return tokenizer, model
 
 # LLM Query Processing Functions
 def is_query_vague(query, tokenizer, model):
     """Use LLM to determine if a query is vague or needs clarification"""
-    prompt = f"""<|system|>
-You are a helpful assistant that determines if a user query about data analysis is clear or vague.
+    prompt = f"""[INST] You are a helpful assistant that determines if a user query about data analysis is clear or vague.
 Respond with only "CLEAR" or "VAGUE" followed by a brief explanation.
 
 A query is CLEAR if it has specific filtering criteria, analysis type, or clear intent.
 A query is VAGUE if it lacks specifics about what data to look at or what analysis to perform.
-<|end|>
-<|user|>
-Query: "{query}"
-<|end|>
-<|assistant|>"""
+
+Query: "{query}" [/INST]"""
     
     inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
     
@@ -56,26 +57,22 @@ Query: "{query}"
         )
     
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response_text = response.split("<|assistant|>")[-1].strip()
+    response_text = response.split("[/INST]")[-1].strip()
     
     return "VAGUE" in response_text.upper(), response_text
 
 def ask_for_clarification(query, tokenizer, model):
     """Generate a clarification question for vague queries"""
-    prompt = f"""<|system|>
-You are a helpful assistant for a diamond inventory analysis system. 
+    prompt = f"""[INST] You are a helpful assistant for a diamond inventory analysis system. 
 The user has asked a vague question and you need to ask for clarification.
 Ask a specific question to understand what they want to analyze.
-<|end|>
-<|user|>
+
 The user asked: "{query}"
 
 Generate a clarification question to understand their specific needs regarding:
 - Which time period (month/year/quarter)
 - Which product attributes (shape, color, bucket)
-- What type of analysis (pricing, inventory gaps, trends, etc.)
-<|end|>
-<|assistant|>"""
+- What type of analysis (pricing, inventory gaps, trends, etc.) [/INST]"""
     
     inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
     
@@ -89,7 +86,7 @@ Generate a clarification question to understand their specific needs regarding:
         )
     
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return response.split("<|assistant|>")[-1].strip()
+    return response.split("[/INST]")[-1].strip()
 
 def process_data_query(query, df, tokenizer, model):
     """Process user query against the data using LLM"""
@@ -112,8 +109,7 @@ def process_data_query(query, df, tokenizer, model):
     Total Records: {len(df)}
     """
     
-    prompt = f"""<|system|>
-You are a data analysis assistant for a diamond inventory system. 
+    prompt = f"""[INST] You are a data analysis assistant for a diamond inventory system. 
 You help users filter and analyze data based on their queries.
 Generate Python code that will filter or analyze the dataframe based on the user's request.
 The dataframe is called 'df' and is already loaded.
@@ -134,11 +130,8 @@ Return only executable Python code that:
 1. Filters the dataframe if needed
 2. Performs the requested analysis
 3. Returns results as 'result' variable (either a dataframe or a summary dict)
-<|end|>
-<|user|>
-{query}
-<|end|>
-<|assistant|>"""
+
+User Query: {query} [/INST]"""
     
     inputs = tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
     
@@ -152,7 +145,7 @@ Return only executable Python code that:
         )
     
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    code_response = response.split("<|assistant|>")[-1].strip()
+    code_response = response.split("[/INST]")[-1].strip()
     
     # Extract Python code from response
     code_match = re.search(r'```python\n(.*?)\n```', code_response, re.DOTALL)
@@ -198,18 +191,14 @@ def generate_analysis_summary(query, result, tokenizer, model):
     else:
         result_summary = str(result)
     
-    prompt = f"""<|system|>
-You are a helpful assistant that summarizes data analysis results in clear, business-friendly language.
-<|end|>
-<|user|>
+    prompt = f"""[INST] You are a helpful assistant that summarizes data analysis results in clear, business-friendly language.
+
 User Query: {query}
 
 Analysis Result:
 {result_summary}
 
-Provide a clear, concise summary of the findings.
-<|end|>
-<|assistant|>"""
+Provide a clear, concise summary of the findings. [/INST]"""
     
     inputs = tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
     
@@ -223,7 +212,7 @@ Provide a clear, concise summary of the findings.
         )
     
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return response.split("<|assistant|>")[-1].strip()
+    return response.split("[/INST]")[-1].strip()
 
 # File history management functions (keeping existing functions)
 def get_history_file_path():
