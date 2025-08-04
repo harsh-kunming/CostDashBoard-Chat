@@ -12,9 +12,23 @@ import json
 import os
 from pathlib import Path
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import gc
 import warnings
+
+# Check transformers version and import accordingly
+try:
+    import transformers
+    from packaging import version
+    
+    if version.parse(transformers.__version__) < version.parse("4.20.0"):
+        st.error("Your transformers version is too old. Please upgrade: pip install transformers>=4.36.0")
+        st.stop()
+    
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except ImportError as e:
+    st.error(f"Failed to import transformers: {e}")
+    st.error("Please install: pip install transformers>=4.36.0")
+    st.stop()
 
 # Initialize Phi-3 model and tokenizer
 @st.cache_resource
