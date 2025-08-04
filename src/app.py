@@ -11,281 +11,23 @@ from utility import *
 import json
 import os
 from pathlib import Path
-import re
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import requests
+from huggingface_hub import InferenceClient
+import pickle
 
-# Initialize the chatbot model
-@st.cache_resource
-def load_chatbot_model():
-    """Load the Hugging Face model for chatbot functionality"""
-    try:
-        # Using Flan-T5 base model - lightweight and good for analytical tasks
-        model_name = "google/flan-t5-base"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-        
-        # Create a text generation pipeline
-        qa_pipeline = pipeline(
-            "text2text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_length=512,
-            device=-1  # Use CPU, set to 0 for GPU
-        )
-        return qa_pipeline
-    except Exception as e:
-        st.error(f"Error loading chatbot model: {e}")
-        return None
+# Initialize Hugging Face Inference Client
+# You'll need to set your HF token as an environment variable or pass it here
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "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")  # Set your token here or as env variable
 
-# Chatbot query processing functions
-def extract_entities_from_query(query: str) -> Dict[str, str]:
-    """Extract relevant entities from the user query"""
-    query_lower = query.lower()
-    
-    entities = {
-        'shape': None,
-        'color': None,
-        'bucket': None,
-        'month': None,
-        'year': None,
-        'metric': None,
-        'analysis_type': None
-    }
-    
-    # Shape patterns
-    shape_patterns = {
-        'cushion': ['cushion', 'cushion shaped', 'cushion-shaped'],
-        'oval': ['oval', 'oval shaped', 'oval-shaped'],
-        'pear': ['pear', 'pear shaped', 'pear-shaped'],
-        'radiant': ['radiant', 'radiant shaped', 'radiant-shaped'],
-        'other': ['other', 'heart', 'emerald', 'marquise']
-    }
-    
-    for shape, patterns in shape_patterns.items():
-        for pattern in patterns:
-            if pattern in query_lower:
-                entities['shape'] = shape.capitalize()
-                break
-    
-    # Color patterns
-    color_patterns = {
-        'WXYZ': ['wxyz', 'w-x-y-z'],
-        'FLY': ['fly'],
-        'FY': ['fy color', 'fy'],
-        'FIY': ['fiy'],
-        'FVY': ['fvy']
-    }
-    
-    for color, patterns in color_patterns.items():
-        for pattern in patterns:
-            if pattern in query_lower:
-                entities['color'] = color
-                break
-    
-    # Bucket patterns
-    bucket_ranges = stock_bucket.keys()
-    for bucket in bucket_ranges:
-        if bucket.lower() in query_lower:
-            entities['bucket'] = bucket
-    
-    # Month patterns
-    months = ['january', 'february', 'march', 'april', 'may', 'june', 
-              'july', 'august', 'september', 'october', 'november', 'december']
-    
-    for month in months:
-        if month in query_lower:
-            entities['month'] = month.capitalize()
-            break
-    
-    # Year patterns
-    year_match = re.search(r'20\d{2}', query_lower)
-    if year_match:
-        entities['year'] = int(year_match.group())
-    
-    # Metric patterns
-    metric_patterns = {
-        'buying price': ['buying price', 'max buying price', 'maximum buying price'],
-        'selling price': ['selling price', 'min selling price', 'minimum selling price'],
-        'average cost': ['average cost', 'avg cost', 'current average cost'],
-        'variance': ['variance', 'variation', 'change'],
-        'mom': ['month over month', 'mom', 'monthly'],
-        'qoq': ['quarter over quarter', 'qoq', 'quarterly'],
-        'gap': ['gap', 'gap analysis', 'stock gap'],
-        'trend': ['trend', 'trending', 'trends'],
-        'summary': ['summary', 'overview', 'summarize']
-    }
-    
-    for metric, patterns in metric_patterns.items():
-        for pattern in patterns:
-            if pattern in query_lower:
-                entities['metric'] = metric
-                break
-    
-    # Analysis type
-    if any(word in query_lower for word in ['variance', 'change', 'mom', 'month over month']):
-        entities['analysis_type'] = 'variance'
-    elif any(word in query_lower for word in ['gap', 'stock gap', 'gap analysis']):
-        entities['analysis_type'] = 'gap'
-    elif any(word in query_lower for word in ['trend', 'trending']):
-        entities['analysis_type'] = 'trend'
-    elif any(word in query_lower for word in ['summary', 'overview']):
-        entities['analysis_type'] = 'summary'
-    else:
-        entities['analysis_type'] = 'general'
-    
-    return entities
+# Initialize the inference client with Mistral-7B-Instruct
+client = InferenceClient(
+    "mistralai/Mistral-7B-Instruct-v0.2",
+    token=HF_TOKEN
+)
 
-def process_chatbot_query(query: str, master_df: pd.DataFrame) -> str:
-    """Process the user query and generate a response based on the data"""
-    if master_df.empty:
-        return "No data available. Please upload and process an Excel file first."
-    
-    # Extract entities from query
-    entities = extract_entities_from_query(query)
-    
-    try:
-        # Filter data based on extracted entities
-        filtered_df = master_df.copy()
-        
-        if entities['shape']:
-            filtered_df = filtered_df[filtered_df['Shape key'] == entities['shape']]
-        if entities['color']:
-            filtered_df = filtered_df[filtered_df['Color Key'] == entities['color']]
-        if entities['bucket']:
-            filtered_df = filtered_df[filtered_df['Buckets'] == entities['bucket']]
-        if entities['month']:
-            filtered_df = filtered_df[filtered_df['Month'] == entities['month']]
-        if entities['year']:
-            filtered_df = filtered_df[filtered_df['Year'] == entities['year']]
-        
-        if filtered_df.empty:
-            return "No data found matching your query criteria. Please check your filters."
-        
-        # Generate response based on analysis type
-        response = ""
-        
-        if entities['analysis_type'] == 'variance' and entities['metric']:
-            # Calculate variance analysis
-            if entities['metric'] == 'buying price':
-                col = 'Max Buying Price'
-            elif entities['metric'] == 'selling price':
-                col = 'Min Selling Price'
-            elif entities['metric'] == 'average cost':
-                col = 'Buying Price Avg'
-            else:
-                col = 'Max Buying Price'  # default
-            
-            # Get variance analysis
-            var_analysis = monthly_variance(filtered_df, col)
-            
-            # Find the most recent month's data
-            if entities['month'] and entities['year']:
-                month_data = var_analysis[
-                    (var_analysis['Month'] == entities['month']) & 
-                    (var_analysis['Year'] == entities['year'])
-                ]
-                if not month_data.empty:
-                    mom_change = month_data['Monthly_change'].values[0]
-                    qoq_change = month_data['qaurter_change'].values[0]
-                    
-                    response = f"For {entities['shape'] or 'all shapes'} diamonds"
-                    if entities['color']:
-                        response += f" with {entities['color']} color"
-                    response += f":\n\n"
-                    response += f"Month-over-Month variance in {entities['metric']}: {mom_change:.2f}%\n"
-                    response += f"Quarter-over-Quarter variance: {qoq_change:.2f}%\n"
-                else:
-                    response = "No variance data available for the specified period."
-            else:
-                # Provide overall trend
-                latest_data = var_analysis.iloc[-1]
-                response = f"Latest {entities['metric']} variance for {entities['shape'] or 'all shapes'}:\n"
-                response += f"Month-over-Month: {latest_data['Monthly_change']:.2f}%\n"
-                response += f"Quarter-over-Quarter: {latest_data['qaurter_change']:.2f}%"
-        
-        elif entities['analysis_type'] == 'gap':
-            # Calculate gap analysis
-            max_qty = filtered_df['Max Qty'].max()
-            min_qty = filtered_df['Min Qty'].min()
-            stock_in_hand = filtered_df.shape[0]
-            gap_value = gap_analysis(max_qty, min_qty, stock_in_hand)
-            
-            response = f"Gap Analysis for {entities['shape'] or 'all shapes'}"
-            if entities['color']:
-                response += f" with {entities['color']} color"
-            response += f":\n\n"
-            response += f"Stock in Hand: {stock_in_hand}\n"
-            response += f"Maximum Quantity: {int(max_qty)}\n"
-            response += f"Minimum Quantity: {int(min_qty)}\n"
-            response += f"Gap: {int(gap_value)} ("
-            response += "Excess" if gap_value > 0 else "Need" if gap_value < 0 else "Adequate"
-            response += ")"
-        
-        elif entities['analysis_type'] == 'summary':
-            # Provide summary statistics
-            total_items = filtered_df.shape[0]
-            avg_weight = filtered_df['Weight'].mean()
-            total_value = filtered_df['Avg Cost Total'].sum()
-            avg_buying_price = filtered_df['Max Buying Price'].mean()
-            
-            response = f"Summary for {entities['shape'] or 'all'} diamonds"
-            if entities['color']:
-                response += f" with {entities['color']} color"
-            response += f":\n\n"
-            response += f"Total Items: {total_items}\n"
-            response += f"Average Weight: {avg_weight:.2f}\n"
-            response += f"Total Value: ${total_value:,.2f}\n"
-            response += f"Average Buying Price: ${avg_buying_price:,.2f}"
-        
-        else:
-            # General query - provide basic statistics
-            total_items = filtered_df.shape[0]
-            unique_shapes = filtered_df['Shape key'].nunique()
-            unique_colors = filtered_df['Color Key'].nunique()
-            
-            response = "Based on your query:\n\n"
-            response += f"Total matching items: {total_items}\n"
-            response += f"Unique shapes: {unique_shapes}\n"
-            response += f"Unique colors: {unique_colors}\n"
-            response += f"\nYou can ask more specific questions about:\n"
-            response += "- Month-over-month variance in buying/selling prices\n"
-            response += "- Gap analysis for specific diamond types\n"
-            response += "- Trends and summaries for different periods"
-        
-        return response
-        
-    except Exception as e:
-        return f"Error processing query: {str(e)}. Please try rephrasing your question."
-
-def generate_ai_response(query: str, data_response: str, qa_pipeline) -> str:
-    """Generate a more natural response using the LLM"""
-    if qa_pipeline is None:
-        return data_response
-    
-    # Create a prompt for the model
-    prompt = f"""Based on the following data analysis, provide a clear and concise answer to the user's question.
-
-User Question: {query}
-
-Data Analysis Results:
-{data_response}
-
-Provide a natural, conversational response that directly answers the user's question:"""
-    
-    try:
-        # Generate response using the model
-        result = qa_pipeline(prompt, max_length=200, do_sample=True, temperature=0.7)
-        ai_response = result[0]['generated_text']
-        
-        # Combine AI response with data
-        final_response = f"{ai_response}\n\n📊 **Detailed Data:**\n{data_response}"
-        return final_response
-    except:
-        # Fallback to data response if model fails
-        return data_response
-
-# File history management functions (keeping existing functions)
+# File history management functions
 def get_history_file_path():
     """Get the path for the history JSON file"""
     history_dir = Path("history")
@@ -356,6 +98,171 @@ def display_upload_history():
         st.sidebar.markdown("---")
         st.sidebar.info("No upload history available")
 
+# LLM Query Processing Functions
+def get_data_schema(df: pd.DataFrame) -> str:
+    """Get a concise schema of the dataframe for LLM context"""
+    schema = f"Dataset shape: {df.shape[0]} rows, {df.shape[1]} columns\n\n"
+    schema += "Columns:\n"
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        unique_count = df[col].nunique()
+        null_count = df[col].isnull().sum()
+        
+        # Sample unique values for categorical columns
+        if unique_count < 20 and dtype == 'object':
+            unique_vals = df[col].dropna().unique()[:10]
+            schema += f"- {col} ({dtype}): {unique_count} unique values, {null_count} nulls. Sample values: {list(unique_vals)}\n"
+        else:
+            schema += f"- {col} ({dtype}): {unique_count} unique values, {null_count} nulls\n"
+    
+    return schema
+
+def get_data_sample(df: pd.DataFrame, n_rows: int = 5) -> str:
+    """Get a sample of the data for LLM context"""
+    sample = df.head(n_rows).to_string()
+    return f"Sample data (first {n_rows} rows):\n{sample}"
+
+def create_llm_prompt(query: str, data_context: str, conversation_history: List[Dict] = None) -> str:
+    """Create a prompt for the LLM with data context"""
+    system_prompt = """You are a data analysis assistant for a Yellow Diamond inventory management system. You help users analyze their diamond inventory data.
+
+Your capabilities:
+1. Understanding and clarifying user queries about the data
+2. Filtering data based on natural language requests
+3. Performing statistical analysis and calculations
+4. Identifying trends and patterns
+5. Providing insights and recommendations
+
+When responding:
+- If a query is vague, ask for clarification
+- Provide specific, actionable insights
+- When filtering data, specify the exact conditions used
+- Format numerical results clearly
+- Suggest follow-up analyses when relevant
+
+Data Context:
+{data_context}
+
+Important columns:
+- Product Id: Unique identifier
+- Shape key: Diamond shape (Cushion, Oval, Pear, Radiant, Other)
+- Color Key: Color classification (WXYZ, FLY, FY, FIY, FVY)
+- Buckets: Weight categories
+- Weight: Diamond weight
+- Average Cost (USD): Cost per unit
+- Max Qty: Maximum quantity threshold
+- Min Qty: Minimum quantity threshold
+- Max Buying Price: Maximum purchase price
+- Min Selling Price: Minimum selling price
+- Month, Year, Quarter: Time dimensions
+"""
+
+    messages = [{"role": "system", "content": system_prompt.format(data_context=data_context)}]
+    
+    # Add conversation history if available
+    if conversation_history:
+        for msg in conversation_history[-5:]:  # Keep last 5 messages for context
+            messages.append(msg)
+    
+    messages.append({"role": "user", "content": query})
+    
+    # Format for Mistral
+    formatted_prompt = ""
+    for msg in messages:
+        if msg["role"] == "system":
+            formatted_prompt += f"<s>[INST] <<SYS>>\n{msg['content']}\n<</SYS>>\n\n"
+        elif msg["role"] == "user":
+            formatted_prompt += f"{msg['content']} [/INST]"
+        elif msg["role"] == "assistant":
+            formatted_prompt += f"{msg['content']}</s><s>[INST] "
+    
+    return formatted_prompt
+
+def query_llm(prompt: str) -> str:
+    """Query the LLM and get response"""
+    try:
+        response = client.text_generation(
+            prompt,
+            max_new_tokens=500,
+            temperature=0.7,
+            top_p=0.95,
+            repetition_penalty=1.1,
+        )
+        return response
+    except Exception as e:
+        return f"Error querying LLM: {str(e)}"
+
+def parse_llm_response(response: str, df: pd.DataFrame) -> Tuple[str, Optional[pd.DataFrame], Optional[Dict]]:
+    """Parse LLM response and extract any data operations"""
+    # This is a simplified parser - in production, you'd want more robust parsing
+    
+    filtered_df = None
+    analysis_results = {}
+    
+    # Check if LLM suggests filtering
+    if "filter" in response.lower():
+        # Extract filter conditions using LLM understanding
+        filter_prompt = f"""Based on this response: "{response}"
+        
+        Extract the exact filter conditions as Python code that can be applied to a pandas DataFrame named 'df'.
+        Return ONLY the filter condition code, nothing else.
+        Example: df[(df['Color Key'] == 'FLY') & (df['Shape key'] == 'Cushion')]
+        """
+        
+        try:
+            filter_code = query_llm(filter_prompt).strip()
+            # Clean the response
+            filter_code = filter_code.replace("```python", "").replace("```", "").strip()
+            
+            # Execute the filter (with safety checks in production)
+            if filter_code.startswith("df["):
+                filtered_df = eval(filter_code, {"df": df, "pd": pd})
+        except:
+            pass
+    
+    # Check if LLM suggests analysis
+    if any(word in response.lower() for word in ["average", "sum", "count", "trend", "analysis"]):
+        # Extract analysis operations
+        analysis_prompt = f"""Based on this response: "{response}"
+        
+        List the statistical operations needed as a JSON object.
+        Example: {{"operation": "mean", "column": "Weight", "groupby": "Color Key"}}
+        Return ONLY the JSON, nothing else.
+        """
+        
+        try:
+            analysis_json = query_llm(analysis_prompt).strip()
+            analysis_json = analysis_json.replace("```json", "").replace("```", "").strip()
+            analysis_results = json.loads(analysis_json)
+        except:
+            pass
+    
+    return response, filtered_df, analysis_results
+
+def execute_data_operation(df: pd.DataFrame, operation: Dict) -> pd.DataFrame:
+    """Execute a data operation based on LLM instructions"""
+    try:
+        if "groupby" in operation:
+            grouped = df.groupby(operation["groupby"])
+            if operation["operation"] == "mean":
+                return grouped[operation["column"]].mean().reset_index()
+            elif operation["operation"] == "sum":
+                return grouped[operation["column"]].sum().reset_index()
+            elif operation["operation"] == "count":
+                return grouped[operation["column"]].count().reset_index()
+        else:
+            if operation["operation"] == "mean":
+                return pd.DataFrame({operation["column"]: [df[operation["column"]].mean()]})
+            elif operation["operation"] == "sum":
+                return pd.DataFrame({operation["column"]: [df[operation["column"]].sum()]})
+            elif operation["operation"] == "count":
+                return pd.DataFrame({operation["column"]: [df[operation["column"]].count()]})
+    except:
+        return pd.DataFrame()
+
+# Enhanced load_data function and other existing functions remain the same...
+# [Previous functions remain unchanged]
+
 def load_data(file):
     # Handle different input types
     if isinstance(file, str):
@@ -399,9 +306,11 @@ def load_data(file):
 
 def save_data(df):
     df.to_pickle('src/kunmings.pkl')
+    
 def create_color_key(df,color_map):
     df['Color Key'] = df.Color.map(lambda x: color_map[x] if x in color_map else '')
     return df
+    
 def create_bucket(df,stock_bucket=stock_bucket):
     """
     df : Monthly Stock Data Sheet
@@ -428,6 +337,7 @@ def create_date_join(df):
     df['Year'] = pd.to_datetime('today').year
     df['Join'] = df['Month'].astype(str) + '-' + df['Year'].map(lambda x: x-2000).astype(str)
     return df
+    
 def concatenate_first_two_rows(df):
     result = {}
     for col in df.columns:
@@ -435,6 +345,7 @@ def concatenate_first_two_rows(df):
         value2 = str(df.iloc[1][col])
         result[col] = f"{value1}_{value2}"
     return result
+    
 def populate_max_qty(df,MONTHLY_STOCK_DATA):
     """
     df : Max Qty Sheet
@@ -494,6 +405,7 @@ def populate_min_qty(df,MONTHLY_STOCK_DATA):
     MONTHLY_STOCK_DATA['Min Qty'] = _MIN_QTY_
     MONTHLY_STOCK_DATA['Min Qty']=MONTHLY_STOCK_DATA['Min Qty'].map(lambda x:x[0] if isinstance(x, list) and len(x) > 0 else 0)
     return MONTHLY_STOCK_DATA
+    
 def populate_selling_prices(df,MONTHLY_STOCK_DATA):
     """
     df : Buying Max Prices Sheet 
@@ -524,6 +436,7 @@ def populate_selling_prices(df,MONTHLY_STOCK_DATA):
     MONTHLY_STOCK_DATA['Min Selling Price']=MONTHLY_STOCK_DATA['Min Selling Price'].map(lambda x: x[0] if (isinstance(x,list) and len(x)>0) else 0)
     MONTHLY_STOCK_DATA['Min Selling Price'] = MONTHLY_STOCK_DATA['Max Buying Price'] * MONTHLY_STOCK_DATA['Min Selling Price'] 
     return MONTHLY_STOCK_DATA
+    
 def populate_buying_prices(df,MONTHLY_STOCK_DATA):
     """
     df : Buying Max Prices Sheet 
@@ -553,6 +466,7 @@ def populate_buying_prices(df,MONTHLY_STOCK_DATA):
     MONTHLY_STOCK_DATA['Max Buying Price'] = _BUYING_PRICE_
     MONTHLY_STOCK_DATA['Max Buying Price']=MONTHLY_STOCK_DATA['Max Buying Price'].map(lambda x:x[0] if isinstance(x, list) and len(x) > 0 else 0)
     return MONTHLY_STOCK_DATA
+    
 def calculate_buying_price_avg(df):
     df['Buying Price Avg'] = df['Max Buying Price'] * df['Weight']
     return df
@@ -577,12 +491,14 @@ def get_quarter(month):
         return f'Q4-{yr}'
     else:
         return None
+        
 def populate_quarter(df):
     """
     df : Monthly Stock Data Sheet
     """
     df['Quarter'] = df['Month'].apply(get_quarter)
     return df
+    
 def create_shape_key(x):
     if x.__contains__(r'HEART'):
         return 'Other'
@@ -607,6 +523,7 @@ def create_shape_key(x):
         return 'Other'
     else:
         return 'Other'
+        
 def poplutate_monthly_stock_sheet(file):
     """
     df_stock : Monthly Stock Data Sheet
@@ -637,6 +554,7 @@ def poplutate_monthly_stock_sheet(file):
     df_stock = populate_selling_prices(df_min_sp,df_stock)
     df_stock.fillna(0,inplace=True)
     return df_stock
+    
 def calculate_qoq_variance_percentage(current_quarter_price, previous_quarter_price):
     """
     Calculate quarter-on-quarter variance percentage of price.
@@ -687,6 +605,7 @@ def calculate_qoq_variance_series(price_data):
         variances.append(variance)
     
     return variances
+    
 def monthly_variance(df,col):
     analysis=df.groupby(['Month','Year'],as_index=False)[col].sum()
     analysis['Num_Month'] = analysis['Month'].map(month_map)
@@ -694,6 +613,7 @@ def monthly_variance(df,col):
     analysis['Monthly_change']=analysis[col].pct_change().fillna(0).round(2)*100
     analysis['qaurter_change']=[0]+calculate_qoq_variance_series(analysis[col].tolist())
     return analysis
+    
 def gap_analysis(max_qty,min_qty,stock_in_hand):
     """
     max_qty : Maximum Quantity
@@ -723,18 +643,7 @@ def get_filtered_data(FILTER_MONTH,FILTE_YEAR,FILTER_SHAPE,FILTER_COLOR,FILTER_B
     master_df = load_data('kunmings.pkl')
     if (type(FILTE_YEAR)==str) & (str(FILTE_YEAR).isnumeric()):
         FILTE_YEAR = int(FILTE_YEAR)
-    #     FILTE_YEAR = int(FILTE_YEAR)
-    #     filter_data=master_df[(master_df['Month'] == FILTER_MONTH) | \
-    #                                   (master_df['Year'] == FILTE_YEAR) | \
-    #                                     (master_df['Shape key'] == FILTER_SHAPE) |\
-    #                                     (master_df['Color Key'] == FILTER_COLOR) |\
-    #                                     (master_df['Buckets'] == FILTER_BUCKET)]
-    # else:
-    #     filter_data=master_df[(master_df['Month'] == FILTER_MONTH) | \
-                                      
-    #                                     (master_df['Shape key'] == FILTER_SHAPE) |\
-    #                                     (master_df['Color Key'] == FILTER_COLOR) |\
-    #                                     (master_df['Buckets'] == FILTER_BUCKET)]
+    
     filter_data=master_df[(master_df['Month'] == FILTER_MONTH) & \
                                       (master_df['Year'] == FILTE_YEAR) & \
                                         (master_df['Shape key'] == FILTER_SHAPE) &\
@@ -751,18 +660,11 @@ def get_filtered_data(FILTER_MONTH,FILTE_YEAR,FILTER_SHAPE,FILTER_COLOR,FILTER_B
         max_buying_price = filter_data['Max Buying Price'].max()
         current_avg_cost = (sum(filter_data['Avg Cost Total'])/(filter_data['Weight'].sum() if filter_data['Weight'].sum() != 0 else 1))*.9
         min_selling_price = filter_data['Min Selling Price'].min()
-        # avg_value = _filter_[FILTER_MONTHLY_VAR_COL].mean()
-        # MOM_Variance = (sum((filter_data[FILTER_MONTHLY_VAR_COL] - avg_value)/ avg_value )/filter_data.shape[0]) * 100
-        # var_analysis = monthly_variance(_filter_,FILTER_MONTHLY_VAR_COL)
-        # MOM_Percent_Change = var_analysis[(var_analysis['Month'] == FILTER_MONTH) & (var_analysis['Year'] == FILTE_YEAR)]['Monthly_change'].values.tolist()[0]
-        # MOM_QoQ_Percent_Change = var_analysis[(var_analysis['Month'] == FILTER_MONTH) & (var_analysis['Year'] == FILTE_YEAR)]['qaurter_change'].values.tolist()[0]
-        # if MOM_Percent_Change == np.inf:
-        #     MOM_Percent_Change = 0
-        # if MOM_QoQ_Percent_Change == np.inf:
-        #     MOM_QoQ_Percent_Change = 0
+        
         return [filter_data,int(max_buying_price),int(current_avg_cost), gap_analysis_op,min_selling_price]
     except:
         return [pd.DataFrame(columns=master_df.columns.tolist()),f"There is {filter_data.shape[0]} rows after filter",f"There is {filter_data.shape[0]} rows after filter",gap_analysis_op,0]
+        
 def get_summary_metrics(filter_data,Filter_Month,FILTER_SHAPE,FILTE_YEAR,FILTER_COLOR,FILTER_BUCKET,FILTER_MONTHLY_VAR_COL):
     FILTE_YEAR = int(FILTE_YEAR)
     master_df = load_data('kunmings.pkl')
@@ -886,6 +788,7 @@ def get_final_data(file,PARENT_DF = 'kunmings.pkl'):
     master_df = master_df.drop_duplicates(subset='Product Id')
     save_data(master_df)
     return master_df
+    
 def sort_months(months):
     """
     Sort months supporting both full names and abbreviations.
@@ -913,6 +816,7 @@ def sort_months(months):
     sorted_months = sorted(months, key=lambda month: month_mapping.get(month, 13))
     
     return sorted_months
+    
 def create_trend_visualization(master_df, selected_shape=None, selected_color=None, selected_bucket=None, selected_variance_column=None):
     """
     Create trend line visualizations for MOM Variance and MOM QoQ Percent Change
@@ -1197,7 +1101,7 @@ def create_summary_charts(master_df, selected_shape, selected_color, selected_bu
             fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', row=i, col=j)
     
     return fig
-
+    
 def main():
     st.set_page_config(page_title="Yellow Diamond Dashboard", layout="wide")
     st.title("Yellow Diamond Dashboard")
@@ -1212,16 +1116,12 @@ def main():
         st.session_state.upload_history = load_upload_history()
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
-    if 'chatbot_model' not in st.session_state:
-        st.session_state.chatbot_model = None
+    if 'query_results' not in st.session_state:
+        st.session_state.query_results = []
         
-    # Load chatbot model
-    if st.session_state.chatbot_model is None:
-        with st.spinner("Loading AI chatbot..."):
-            st.session_state.chatbot_model = load_chatbot_model()
-    
     # Sidebar for controls
     st.sidebar.header("Controls")
+    
     # File upload
     uploaded_file = st.sidebar.file_uploader(
         "Upload Excel File",
@@ -1232,50 +1132,60 @@ def main():
     # Display upload history
     display_upload_history()
     
-    # Main content area with tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "💬 AI Assistant", "📈 Analytics"])
+    # Main content area
+    if uploaded_file is not None and not st.session_state.data_processed:
+        with st.spinner("Processing Excel file..."):
+            try:
+                # Get file size
+                file_size = uploaded_file.size if hasattr(uploaded_file, 'size') else None
+                
+                # Process the file
+                st.subheader("🗄️ Master Database")
+                st.session_state.master_df = get_final_data(uploaded_file)
+                st.session_state.data_processed = True
+                
+                # Add to upload history after successful processing
+                st.session_state.upload_history = add_to_upload_history(
+                    filename=uploaded_file.name,
+                    file_size=file_size
+                )
+                
+                # Show success message
+                st.success(f"✅ Successfully processed: {uploaded_file.name}")
+                
+                # Force sidebar refresh to show updated history
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"Error processing file: {str(e)}")
+                # Still add to history but mark as failed
+                history = load_upload_history()
+                new_entry = {
+                    "filename": uploaded_file.name,
+                    "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "file_size": uploaded_file.size if hasattr(uploaded_file, 'size') else None,
+                    "status": "Failed"
+                }
+                history.insert(0, new_entry)
+                history = history[:10]
+                save_upload_history(history)
+                st.session_state.upload_history = history
     
-    with tab1:
-        # Main dashboard content
-        if uploaded_file is not None and not st.session_state.data_processed:
-            with st.spinner("Processing Excel file..."):
-                try:
-                    # Get file size
-                    file_size = uploaded_file.size if hasattr(uploaded_file, 'size') else None
-                    
-                    # Process the file
-                    st.subheader("🗄️ Master Database")
-                    st.session_state.master_df = get_final_data(uploaded_file)
-                    st.session_state.data_processed = True
-                    
-                    # Add to upload history after successful processing
-                    st.session_state.upload_history = add_to_upload_history(
-                        filename=uploaded_file.name,
-                        file_size=file_size
-                    )
-                    
-                    # Show success message
-                    st.success(f"✅ Successfully processed: {uploaded_file.name}")
-                    
-                    # Force sidebar refresh to show updated history
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Error processing file: {str(e)}")
-                    # Still add to history but mark as failed
-                    history = load_upload_history()
-                    new_entry = {
-                        "filename": uploaded_file.name,
-                        "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "file_size": uploaded_file.size if hasattr(uploaded_file, 'size') else None,
-                        "status": "Failed"
-                    }
-                    history.insert(0, new_entry)
-                    history = history[:10]
-                    save_upload_history(history)
-                    st.session_state.upload_history = history
-                    
-        if not st.session_state.master_df.empty or uploaded_file is not None:
+    # Check if we have data loaded
+    if st.session_state.master_df.empty:
+        # Try to load from pickle file
+        try:
+            st.session_state.master_df = load_data('kunmings.pkl')
+            st.session_state.data_processed = True
+        except:
+            pass
+    
+    if not st.session_state.master_df.empty:
+        # Create tabs for different functionalities
+        tab1, tab2 = st.tabs(["📊 Dashboard", "💬 AI Assistant"])
+        
+        with tab1:
+            # Original dashboard functionality
             Month,Year,Shape,Color,Bucket,Variance_Column = st.columns(6)
             with Month:
                 categories = ["None"]+sort_months(list(st.session_state.master_df['Month'].unique()))
@@ -1295,7 +1205,7 @@ def main():
             with Variance_Column:
                 variance_columns = ["None"]+['Current Average Cost','Max Buying Price','Min Selling Price']
                 selected_variance_column = st.selectbox("Select Variance Column", variance_columns)
-            
+                
             # Apply filters
             filtered_df = st.session_state.master_df.copy()
             if ((selected_month != "None") & (selected_year != "None") & (selected_shape != "None") & (selected_color != "None") & (selected_bucket != "None")) :
@@ -1343,8 +1253,35 @@ def main():
                         st.metric("MOM QoQ Percent Change", f"0")
                         
                     st.subheader("No Data Present for This Filter")
+                    
+                # Add visualization section
+                st.subheader("📈 Trend Analysis")
                 
-                # Data table and downloads section
+                # Create tabs for different visualizations
+                tab1_1, tab1_2 = st.tabs(["📊 Variance Trends", "📈 Summary Analytics"])
+                
+                with tab1_1:
+                    if selected_variance_column != "None":
+                        trend_fig = create_trend_visualization(
+                            st.session_state.master_df, 
+                            selected_shape, 
+                            selected_color, 
+                            selected_bucket, 
+                            selected_variance_column
+                        )
+                        st.plotly_chart(trend_fig, use_container_width=True)
+                    else:
+                        st.info("Please select a variance column to view trend analysis.")
+                
+                with tab1_2:
+                    summary_fig = create_summary_charts(
+                        st.session_state.master_df, 
+                        selected_shape, 
+                        selected_color, 
+                        selected_bucket
+                    )
+                    st.plotly_chart(summary_fig, use_container_width=True)
+                
                 st.subheader("📊 Data Table")
                 st.dataframe(
                     filter_data,
@@ -1353,6 +1290,7 @@ def main():
                         )
                 # Download processed data
                 st.subheader("💾 Download Filtered Data")
+                # filter_data['Avg Cost Total'] = filter_data['avg']
                 csv = filter_data.loc[:,['Product Id','Shape key','Color Key','Avg Cost Total','Min Qty','Max Qty','Buying Price Avg','Max Buying Price']].to_csv(index=False)
                 st.download_button(
                 label="Download Filtered Data as CSV",
@@ -1398,6 +1336,7 @@ def main():
                             return ['background-color: #ffffba; color: #c62828'] * len(row)
                         else:
                             return [''] * len(row)
+                            
                 styled_df = gap_summary_df.style.apply(highlight_shape_gap, axis=1)
                 
                 st.dataframe(
@@ -1435,164 +1374,109 @@ def main():
                 
             if not ((selected_month != "None") & (selected_year != "None") & (selected_shape != "None") & (selected_color != "None") & (selected_bucket != "None")):
                 st.info("Please select all filter values except 'Select Variance Column' to view detailed metrics.")
+        
+        with tab2:
+            # AI Assistant Tab
+            st.subheader("🤖 AI Assistant for Data Analysis")
+            st.markdown("Ask questions about your diamond inventory data in natural language!")
             
-        else:
-            st.info("No data in master database. Upload an Excel file to get started!")
-    
-    with tab2:
-        # AI Assistant Tab
-        st.subheader("🤖 AI Diamond Analytics Assistant")
-        st.markdown("Ask questions about your diamond inventory data in natural language!")
-        
-        # Example queries
-        with st.expander("📝 Example Queries", expanded=False):
-            st.markdown("""
-            - What is the month-over-month variance in buying price for Cushion shaped diamonds with FY color?
-            - Show me the gap analysis for Oval diamonds in bucket C1
-            - What's the trend for selling prices of Pear shaped diamonds?
-            - Give me a summary of all WXYZ colored diamonds
-            - What is the current average cost for Radiant diamonds in January 2024?
-            - Show me the quarter-over-quarter change for FLY colored diamonds
-            """)
-        
-        # Chat interface
-        chat_container = st.container()
-        
-        # Display chat history
-        with chat_container:
+            # Display chat history
             for message in st.session_state.chat_history:
-                if message["role"] == "user":
-                    st.chat_message("user").write(message["content"])
-                else:
-                    st.chat_message("assistant").write(message["content"])
+                with st.chat_message(message["role"]):
+                    st.write(message["content"])
+                    if "data" in message:
+                        st.dataframe(message["data"], use_container_width=True)
+            
+            # User input
+            user_query = st.chat_input("Ask a question about your data...")
+            
+            if user_query:
+                # Add user message to chat history
+                st.session_state.chat_history.append({"role": "user", "content": user_query})
+                
+                # Display user message
+                with st.chat_message("user"):
+                    st.write(user_query)
+                
+                # Process query with LLM
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        # Prepare data context
+                        data_schema = get_data_schema(st.session_state.master_df)
+                        data_sample = get_data_sample(st.session_state.master_df)
+                        data_context = f"{data_schema}\n\n{data_sample}"
+                        
+                        # Create prompt
+                        prompt = create_llm_prompt(
+                            user_query, 
+                            data_context, 
+                            st.session_state.chat_history[:-1]  # Exclude the last user message
+                        )
+                        
+                        # Query LLM
+                        llm_response = query_llm(prompt)
+                        
+                        # Parse response
+                        response_text, filtered_data, analysis_results = parse_llm_response(
+                            llm_response, 
+                            st.session_state.master_df
+                        )
+                        
+                        # Display response
+                        st.write(response_text)
+                        
+                        # If data was filtered, display it
+                        if filtered_data is not None and not filtered_data.empty:
+                            st.dataframe(filtered_data, use_container_width=True)
+                            
+                            # Add download button for filtered data
+                            csv = filtered_data.to_csv(index=False)
+                            st.download_button(
+                                label="Download Query Results",
+                                data=csv,
+                                file_name=f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                            
+                            # Add to chat history with data
+                            st.session_state.chat_history.append({
+                                "role": "assistant", 
+                                "content": response_text,
+                                "data": filtered_data
+                            })
+                        else:
+                            # Add to chat history without data
+                            st.session_state.chat_history.append({
+                                "role": "assistant", 
+                                "content": response_text
+                            })
+                        
+                        # Execute any analysis operations
+                        if analysis_results:
+                            try:
+                                analysis_df = execute_data_operation(
+                                    filtered_data if filtered_data is not None else st.session_state.master_df,
+                                    analysis_results
+                                )
+                                if not analysis_df.empty:
+                                    st.subheader("Analysis Results:")
+                                    st.dataframe(analysis_df, use_container_width=True)
+                            except Exception as e:
+                                st.error(f"Error executing analysis: {str(e)}")
+            
+            # Clear chat button
+            if st.button("Clear Chat History"):
+                st.session_state.chat_history = []
+                st.rerun()
+                
+    else:
+        st.info("No data in master database. Upload an Excel file to get started!")
         
-        # Chat input
-        user_query = st.chat_input("Ask about your diamond data...")
-        
-        if user_query:
-            # Add user message to chat history
-            st.session_state.chat_history.append({"role": "user", "content": user_query})
-            
-            # Display user message
-            st.chat_message("user").write(user_query)
-            
-            # Generate response
-            with st.spinner("Analyzing your query..."):
-                # Process the query
-                data_response = process_chatbot_query(user_query, st.session_state.master_df)
-                
-                # Generate AI-enhanced response if model is available
-                if st.session_state.chatbot_model:
-                    final_response = generate_ai_response(user_query, data_response, st.session_state.chatbot_model)
-                else:
-                    final_response = data_response
-                
-                # Add assistant response to chat history
-                st.session_state.chat_history.append({"role": "assistant", "content": final_response})
-                
-                # Display assistant response
-                st.chat_message("assistant").write(final_response)
-        
-        # Clear chat button
-        if st.button("Clear Chat History"):
-            st.session_state.chat_history = []
-            st.rerun()
-    
-    with tab3:
-        # Analytics Tab
-        if not st.session_state.master_df.empty:
-            st.subheader("📈 Trend Analysis")
-            
-            # Create tabs for different visualizations
-            st.markdown("""
-            <style>
-                /* Style all tab labels */
-                .stTabs [data-baseweb="tab-list"] {
-                    gap: 24px;
-                }
-                
-                .stTabs [data-baseweb="tab-list"] button {
-                    height: 50px;
-                    padding-left: 20px;
-                    padding-right: 20px;
-                }
-                
-                /* Inactive tabs - VIOLET */
-                .stTabs [data-baseweb="tab-list"] button p {
-                    color: #8B00FF;  /* Violet for inactive tabs */
-                    font-size: 18px;
-                }
-                
-                /* Active tab - RED */
-                .stTabs [data-baseweb="tab-list"] button[aria-selected="true"] p {
-                    color: #FF0000;  /* Red for active tab */
-                    font-weight: bold;
-                }
-                
-                /* Hover effect */
-                .stTabs [data-baseweb="tab-list"] button:hover p {
-                    color: #FF0000;
-                    transition: color 0.3s;
-                }
-                
-                /* Tab underline/highlight - RED */
-                .stTabs [data-baseweb="tab-highlight"] {
-                    background-color: #FF0000;
-                    height: 3px;
-                }
-                
-                /* Tab panels background (optional) */
-                .stTabs [data-baseweb="tab-panel"] {
-                    padding-top: 20px;
-                }
-            </style>
-            """, unsafe_allow_html=True)
-            
-            viz_tab1, viz_tab2 = st.tabs(["📊 Variance Trends", "📈 Summary Analytics"])
-            
-            # Add filter controls for analytics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                shapes_analytics = ["None"] + list(st.session_state.master_df['Shape key'].unique())
-                selected_shape_analytics = st.selectbox("Filter by Shape", shapes_analytics, key="shape_analytics")
-            with col2:
-                colors_analytics = ["None"] + ['WXYZ','FLY','FY','FIY','FVY']
-                selected_color_analytics = st.selectbox("Filter by Color", colors_analytics, key="color_analytics")
-            with col3:
-                buckets_analytics = ["None"] + list(stock_bucket.keys())
-                selected_bucket_analytics = st.selectbox("Filter by Bucket", buckets_analytics, key="bucket_analytics")
-            with col4:
-                variance_columns_analytics = ["None"] + ['Current Average Cost','Max Buying Price','Min Selling Price']
-                selected_variance_column_analytics = st.selectbox("Select Variance Column", variance_columns_analytics, key="variance_analytics")
-            
-            with viz_tab1:
-                if selected_variance_column_analytics != "None":
-                    trend_fig = create_trend_visualization(
-                        st.session_state.master_df, 
-                        selected_shape_analytics if selected_shape_analytics != "None" else None, 
-                        selected_color_analytics if selected_color_analytics != "None" else None, 
-                        selected_bucket_analytics if selected_bucket_analytics != "None" else None, 
-                        selected_variance_column_analytics
-                    )
-                    st.plotly_chart(trend_fig, use_container_width=True)
-                else:
-                    st.info("Please select a variance column to view trend analysis.")
-            
-            with viz_tab2:
-                summary_fig = create_summary_charts(
-                    st.session_state.master_df, 
-                    selected_shape_analytics if selected_shape_analytics != "None" else None, 
-                    selected_color_analytics if selected_color_analytics != "None" else None, 
-                    selected_bucket_analytics if selected_bucket_analytics != "None" else None
-                )
-                st.plotly_chart(summary_fig, use_container_width=True)
-        else:
-            st.info("No data available. Please upload and process an Excel file first.")
-    
-    # Reset button in sidebar
+    # Reset button
     if st.sidebar.button("Reset Data Processing"):
         st.session_state.data_processed = False
         st.session_state.master_df = pd.DataFrame()
+        st.session_state.chat_history = []
         st.rerun()
     
     # Clear history button
@@ -1601,6 +1485,16 @@ def main():
         st.session_state.upload_history = []
         st.success("Upload history cleared!")
         st.rerun()
+    
+    # Add note about Hugging Face token
+    with st.sidebar.expander("⚙️ AI Assistant Settings"):
+        st.markdown("""
+        **Note:** To use the AI Assistant, you need to:
+        1. Set your Hugging Face token as an environment variable: `HUGGINGFACE_TOKEN`
+        2. Or modify the code to include your token directly
+        
+        The assistant uses Mistral-7B-Instruct model via Hugging Face Inference API.
+        """)
     
 if __name__ == "__main__":
     main()
