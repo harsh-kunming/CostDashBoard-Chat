@@ -11,21 +11,31 @@ from utility import *
 import json
 import os
 from pathlib import Path
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import requests
-from huggingface_hub import InferenceClient
+import time
 import pickle
 
-# Initialize Hugging Face Inference Client
-# You'll need to set your HF token as an environment variable or pass it here
-HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "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")  # Set your token here or as env variable
+# Initialize Hugging Face setup
+# Try multiple sources for the token
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "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")
 
-# Initialize the inference client with Mistral-7B-Instruct
-client = InferenceClient(
-    "Qwen/Qwen3-30B-A3B-Thinking-2507",
-    token=HF_TOKEN
-)
+# Also try Streamlit secrets
+if not HF_TOKEN:
+    try:
+        if hasattr(st, 'secrets') and 'HUGGINGFACE_TOKEN' in st.secrets:
+            HF_TOKEN = st.secrets["HUGGINGFACE_TOKEN"]
+    except:
+        pass
+
+# Alternative: Use the free Inference API without token for testing
+if not HF_TOKEN:
+    # Use the serverless inference API (may have rate limits)
+    API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+    headers = {}
+else:
+    # Use authenticated API
+    API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
 
 # File history management functions
 def get_history_file_path():
@@ -122,6 +132,47 @@ def get_data_sample(df: pd.DataFrame, n_rows: int = 5) -> str:
     sample = df.head(n_rows).to_string()
     return f"Sample data (first {n_rows} rows):\n{sample}"
 
+def generate_fallback_response(query: str, df: pd.DataFrame) -> str:
+    """Generate a simple response when LLM is not available"""
+    query_lower = query.lower()
+    
+    # Check for common query patterns
+    if "how many" in query_lower or "count" in query_lower:
+        return f"The dataset contains {len(df)} total records. You can use the filters in the Dashboard tab to explore specific subsets of data."
+    
+    elif "average" in query_lower or "mean" in query_lower:
+        if "weight" in query_lower:
+            avg_weight = df['Weight'].mean()
+            return f"The average weight across all diamonds is {avg_weight:.2f}."
+        elif "cost" in query_lower or "price" in query_lower:
+            avg_cost = df['Avg Cost Total'].mean()
+            return f"The average cost total is ${avg_cost:.2f}."
+        else:
+            return "I can help you calculate averages. Please specify which column you'd like to analyze (e.g., weight, cost, price)."
+    
+    elif "filter" in query_lower or "show" in query_lower:
+        return """To filter data, I can help you with:
+        - Shape: Cushion, Oval, Pear, Radiant, Other
+        - Color: WXYZ, FLY, FY, FIY, FVY
+        - Buckets: B1, B2, B3, B4, B5
+        
+        Please specify your filter criteria, or use the Dashboard tab for interactive filtering."""
+    
+    elif "gap" in query_lower:
+        return "GAP analysis shows the difference between stock in hand and min/max quantity thresholds. Check the GAP Summary section in the Dashboard tab for detailed analysis."
+    
+    elif "trend" in query_lower:
+        return "For trend analysis, please use the Dashboard tab and select the Variance Trends visualization. You can analyze trends for Max Buying Price, Current Average Cost, or Min Selling Price."
+    
+    else:
+        return """I'm here to help you analyze your diamond inventory data. You can ask me to:
+        - Filter data by shape, color, or bucket
+        - Calculate averages, sums, or counts
+        - Analyze trends and patterns
+        - Perform GAP analysis
+        
+        For the best experience, please set up a Hugging Face token (see AI Assistant Settings in the sidebar)."""
+
 def create_llm_prompt(query: str, data_context: str, conversation_history: List[Dict] = None) -> str:
     """Create a prompt for the LLM with data context"""
     system_prompt = """You are a data analysis assistant for a Yellow Diamond inventory management system. You help users analyze their diamond inventory data.
@@ -157,84 +208,177 @@ Important columns:
 - Month, Year, Quarter: Time dimensions
 """
 
-    messages = [{"role": "system", "content": system_prompt.format(data_context=data_context)}]
-    
-    # Add conversation history if available
-    if conversation_history:
-        for msg in conversation_history[-5:]:  # Keep last 5 messages for context
-            messages.append(msg)
-    
-    messages.append({"role": "user", "content": query})
-    
-    # Format for Mistral
-    formatted_prompt = ""
-    for msg in messages:
-        if msg["role"] == "system":
-            formatted_prompt += f"<s>[INST] <<SYS>>\n{msg['content']}\n<</SYS>>\n\n"
-        elif msg["role"] == "user":
-            formatted_prompt += f"{msg['content']} [/INST]"
-        elif msg["role"] == "assistant":
-            formatted_prompt += f"{msg['content']}</s><s>[INST] "
+    # For Mistral format
+    formatted_prompt = f"<s>[INST] {system_prompt.format(data_context=data_context)}\n\nUser: {query} [/INST]"
     
     return formatted_prompt
 
-def query_llm(prompt: str) -> str:
-    """Query the LLM and get response"""
-    try:
-        response = client.text_generation(
-            prompt,
-            max_new_tokens=500,
-            temperature=0.7,
-            top_p=0.95,
-            repetition_penalty=1.1,
-        )
-        return response
-    except Exception as e:
-        return f"Error querying LLM: {str(e)}"
+def query_llm(prompt: str, max_retries: int = 3) -> str:
+    """Query the LLM and get response with retry logic"""
+    
+    # Extract the actual user query from the prompt
+    if "User: " in prompt:
+        user_query = prompt.split("User: ")[-1].split(" [/INST]")[0]
+    else:
+        user_query = prompt
+    
+    # Check if running in test mode
+    if st.session_state.get('test_mode', False):
+        return generate_fallback_response(user_query, 
+                                        st.session_state.get('master_df', pd.DataFrame()))
+    
+    # First, try using a local model if available (for testing without API)
+    if not HF_TOKEN:
+        return """I understand your query. However, to provide accurate analysis, I need access to the Hugging Face API. 
+        
+Please set up your Hugging Face token:
+1. Sign up at huggingface.co
+2. Get your API token from Settings → Access Tokens
+3. Set it as an environment variable: export HUGGINGFACE_TOKEN="your-token"
+
+For now, I can suggest that you use the filter options in the Dashboard tab to explore your data.
+You can also enable Test Mode in the AI Assistant Settings to use basic query processing."""
+    
+    for attempt in range(max_retries):
+        try:
+            payload = {
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": 500,
+                    "temperature": 0.7,
+                    "top_p": 0.95,
+                    "do_sample": True,
+                    "return_full_text": False
+                }
+            }
+            
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+            
+            if response.status_code == 503:
+                # Model is loading
+                estimated_time = response.json().get('estimated_time', 20)
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(min(estimated_time, 30))
+                    continue
+                else:
+                    return "The model is currently loading. Please try again in a few moments."
+            
+            response.raise_for_status()
+            
+            # Parse response
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                return result[0].get('generated_text', '')
+            elif isinstance(result, dict):
+                return result.get('generated_text', '')
+            else:
+                return str(result)
+                
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                continue
+            return "Request timed out. Please try again."
+            
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                continue
+            return f"API Error: {str(e)}. Please check your Hugging Face token and internet connection."
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                continue
+            return f"Unexpected error: {str(e)}"
+    
+    return "Failed to get response after multiple attempts. Please try again later."
 
 def parse_llm_response(response: str, df: pd.DataFrame) -> Tuple[str, Optional[pd.DataFrame], Optional[Dict]]:
     """Parse LLM response and extract any data operations"""
-    # This is a simplified parser - in production, you'd want more robust parsing
+    
+    # Check if response is an error message
+    if "API Error" in response or "Please set up your Hugging Face token" in response:
+        return response, None, {}
     
     filtered_df = None
     analysis_results = {}
     
-    # Check if LLM suggests filtering
-    if "filter" in response.lower():
-        # Extract filter conditions using LLM understanding
-        filter_prompt = f"""Based on this response: "{response}"
-        
-        Extract the exact filter conditions as Python code that can be applied to a pandas DataFrame named 'df'.
-        Return ONLY the filter condition code, nothing else.
-        Example: df[(df['Color Key'] == 'FLY') & (df['Shape key'] == 'Cushion')]
-        """
-        
+    # Simple keyword-based filtering as fallback
+    response_lower = response.lower()
+    
+    # Check for filter intent
+    if any(word in response_lower for word in ["filter", "show", "find", "get", "display"]):
         try:
-            filter_code = query_llm(filter_prompt).strip()
-            # Clean the response
-            filter_code = filter_code.replace("```python", "").replace("```", "").strip()
+            # Extract filter criteria from response
+            filter_conditions = []
             
-            # Execute the filter (with safety checks in production)
-            if filter_code.startswith("df["):
-                filtered_df = eval(filter_code, {"df": df, "pd": pd})
-        except:
+            # Check for shape mentions
+            for shape in ['cushion', 'oval', 'pear', 'radiant', 'other']:
+                if shape in response_lower:
+                    filter_conditions.append(f"(df['Shape key'] == '{shape.capitalize()}')")
+            
+            # Check for color mentions
+            for color in ['wxyz', 'fly', 'fy', 'fiy', 'fvy']:
+                if color in response_lower:
+                    filter_conditions.append(f"(df['Color Key'] == '{color.upper()}')")
+            
+            # Check for bucket mentions
+            for bucket in ['b1', 'b2', 'b3', 'b4', 'b5']:
+                if bucket in response_lower:
+                    filter_conditions.append(f"(df['Buckets'] == '{bucket.upper()}')")
+            
+            # Apply filters if any were found
+            if filter_conditions:
+                filter_expr = " & ".join(filter_conditions)
+                filtered_df = eval(f"df[{filter_expr}]")
+                
+        except Exception as e:
+            # If filtering fails, continue without filtered data
             pass
     
-    # Check if LLM suggests analysis
-    if any(word in response.lower() for word in ["average", "sum", "count", "trend", "analysis"]):
-        # Extract analysis operations
-        analysis_prompt = f"""Based on this response: "{response}"
-        
-        List the statistical operations needed as a JSON object.
-        Example: {{"operation": "mean", "column": "Weight", "groupby": "Color Key"}}
-        Return ONLY the JSON, nothing else.
-        """
-        
+    # Check for analysis intent
+    if any(word in response_lower for word in ["average", "mean", "sum", "total", "count", "trend", "analysis"]):
         try:
-            analysis_json = query_llm(analysis_prompt).strip()
-            analysis_json = analysis_json.replace("```json", "").replace("```", "").strip()
-            analysis_results = json.loads(analysis_json)
-        except:
+            # Determine operation type
+            if "average" in response_lower or "mean" in response_lower:
+                operation = "mean"
+            elif "sum" in response_lower or "total" in response_lower:
+                operation = "sum"
+            elif "count" in response_lower:
+                operation = "count"
+            else:
+                operation = "mean"  # default
+            
+            # Determine column
+            if "weight" in response_lower:
+                column = "Weight"
+            elif "price" in response_lower or "cost" in response_lower:
+                if "buying" in response_lower:
+                    column = "Max Buying Price"
+                elif "selling" in response_lower:
+                    column = "Min Selling Price"
+                else:
+                    column = "Avg Cost Total"
+            else:
+                column = "Weight"  # default
+            
+            # Determine groupby
+            groupby = None
+            if "by shape" in response_lower or "for each shape" in response_lower:
+                groupby = "Shape key"
+            elif "by color" in response_lower or "for each color" in response_lower:
+                groupby = "Color Key"
+            elif "by bucket" in response_lower or "for each bucket" in response_lower:
+                groupby = "Buckets"
+            
+            analysis_results = {
+                "operation": operation,
+                "column": column
+            }
+            if groupby:
+                analysis_results["groupby"] = groupby
+                
+        except Exception as e:
+            # If analysis parsing fails, continue
             pass
     
     return response, filtered_df, analysis_results
@@ -1118,6 +1262,8 @@ def main():
         st.session_state.chat_history = []
     if 'query_results' not in st.session_state:
         st.session_state.query_results = []
+    if 'test_mode' not in st.session_state:
+        st.session_state.test_mode = False
         
     # Sidebar for controls
     st.sidebar.header("Controls")
@@ -1380,6 +1526,27 @@ def main():
             st.subheader("🤖 AI Assistant for Data Analysis")
             st.markdown("Ask questions about your diamond inventory data in natural language!")
             
+            # Show mode status
+            if st.session_state.get('test_mode', False):
+                st.info("🧪 Running in Test Mode - Limited functionality without API")
+            elif not HF_TOKEN:
+                st.warning("⚠️ No Hugging Face token found. Enable Test Mode or configure token in AI Assistant Settings.")
+            else:
+                st.success("✅ AI Assistant ready with Mistral-7B model")
+            
+            # Example queries
+            with st.expander("💡 Example Queries"):
+                st.markdown("""
+                **Try these example queries:**
+                - Show me all cushion diamonds with color FLY
+                - What's the average weight of diamonds in bucket B1?
+                - Filter data for January 2024
+                - Which shape has the highest average cost?
+                - Show diamonds with negative gap values
+                - Calculate the total value of oval diamonds
+                - What are the trends for buying prices?
+                """)
+            
             # Display chat history
             for message in st.session_state.chat_history:
                 with st.chat_message(message["role"]):
@@ -1415,6 +1582,13 @@ def main():
                         
                         # Query LLM
                         llm_response = query_llm(prompt)
+                        
+                        # If LLM fails, use fallback
+                        if ("Please set up your Hugging Face token" in llm_response or 
+                            "API Error" in llm_response or 
+                            "enable Test Mode" in llm_response):
+                            # Use fallback response generator
+                            llm_response = generate_fallback_response(user_query, st.session_state.master_df)
                         
                         # Parse response
                         response_text, filtered_data, analysis_results = parse_llm_response(
@@ -1488,13 +1662,70 @@ def main():
     
     # Add note about Hugging Face token
     with st.sidebar.expander("⚙️ AI Assistant Settings"):
-        st.markdown("""
-        **Note:** To use the AI Assistant, you need to:
-        1. Set your Hugging Face token as an environment variable: `HUGGINGFACE_TOKEN`
-        2. Or modify the code to include your token directly
+        st.markdown("### AI Assistant Status")
         
-        The assistant uses Mistral-7B-Instruct model via Hugging Face Inference API.
+        if HF_TOKEN:
+            st.success("✅ Hugging Face token configured")
+        else:
+            st.warning("⚠️ Hugging Face token not found")
+            
+        # Test mode toggle
+        test_mode = st.checkbox("Enable Test Mode (No API Required)", 
+                               value=st.session_state.get('test_mode', False),
+                               help="Use basic pattern matching instead of LLM. Limited functionality but no API required.")
+        
+        if test_mode != st.session_state.get('test_mode', False):
+            st.session_state.test_mode = test_mode
+            
+        st.markdown("""
+        **Setup Instructions:**
+        
+        1. **Get a free Hugging Face account:**
+           - Sign up at [huggingface.co](https://huggingface.co/join)
+           
+        2. **Get your API token:**
+           - Go to Settings → [Access Tokens](https://huggingface.co/settings/tokens)
+           - Create a new token (read access is sufficient)
+           
+        3. **Set the token** (choose one):
+           - **Option A - Environment Variable:**
+             ```bash
+             export HUGGINGFACE_TOKEN="hf_..."
+             ```
+           - **Option B - Streamlit Secrets:**
+             Create `.streamlit/secrets.toml`:
+             ```toml
+             HUGGINGFACE_TOKEN = "hf_..."
+             ```
+           - **Option C - Direct in Code:**
+             Edit line 19: `HF_TOKEN = "hf_..."`
+        
+        **Model:** Mistral-7B-Instruct-v0.2
+        
+        **Note:** The free tier may have rate limits. For production use, consider using a paid plan.
         """)
+        
+        # Test connection button
+        if st.button("Test AI Connection"):
+            with st.spinner("Testing connection..."):
+                # Temporarily disable test mode for connection test
+                original_test_mode = st.session_state.get('test_mode', False)
+                st.session_state.test_mode = False
+                
+                # Simple test prompt
+                test_prompt = "<s>[INST] Hello, please respond with 'Connection successful!' [/INST]"
+                test_response = query_llm(test_prompt)
+                
+                # Restore test mode
+                st.session_state.test_mode = original_test_mode
+                
+                if any(phrase in test_response.lower() for phrase in ["connection successful", "hello", "hi", "greetings"]):
+                    st.success("✅ Connection successful! LLM is responding.")
+                elif "enable Test Mode" in test_response:
+                    st.info("No API token found. You can enable Test Mode above for basic functionality.")
+                else:
+                    # Show truncated response
+                    st.error(f"Connection test result: {test_response[:200]}...")
     
 if __name__ == "__main__":
     main()
