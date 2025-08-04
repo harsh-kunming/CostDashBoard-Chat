@@ -52,7 +52,7 @@ if 'current_model_strategy' not in st.session_state:
     st.session_state.current_model_strategy = "api"
 
 # Initialize Hugging Face setup
-HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "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")
 
 # Also try Streamlit secrets
 if not HF_TOKEN:
