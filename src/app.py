@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List
 from datetime import datetime
 from io import BytesIO
 import streamlit as st
@@ -12,253 +12,220 @@ import json
 import os
 from pathlib import Path
 import torch
-import gc
-import warnings
-import time
-os.environ["HUGGING_FACE_HUB_TOKEN"] = "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"
-hf_token = "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"
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import re
 
-# Check transformers version and import accordingly
-try:
-    import transformers
-    from packaging import version
-    
-    if version.parse(transformers.__version__) < version.parse("4.20.0"):
-        st.error("Your transformers version is too old. Please upgrade: pip install transformers>=4.36.0")
-        st.stop()
-    
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-except ImportError as e:
-    st.error(f"Failed to import transformers: {e}")
-    st.error("Please install: pip install transformers>=4.36.0")
-    st.stop()
-
-# Initialize Phi-3 model and tokenizer
+# Initialize LLM model and tokenizer
 @st.cache_resource
 def load_llm_model():
-    """Load the LLM model with proper error handling and fallbacks"""
-    import time
-    import os
-    
-    # Set cache directory
-    cache_dir = "./model_cache"
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ['TRANSFORMERS_CACHE'] = cache_dir
-    os.environ['HF_HOME'] = cache_dir
-    
-    # Suppress all warnings
-    import warnings
-    warnings.filterwarnings('ignore')
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # List of models to try
-    models_to_try = [
-        ("microsoft/DialoGPT-small", False, "conversational"),  # 117M params, easier to load
-        ("google/flan-t5-small", False, "text2text"),  # 77M params
-        ("distilgpt2", False, "causal")  # 82M params
-    ]
-    
-    for model_name, trust_remote, model_type in models_to_try:
-        try:
-            st.info(f"Loading {model_name}...")
-            
-            # Try loading with retries
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    if model_type == "text2text":
-                        from transformers import T5ForConditionalGeneration, T5Tokenizer
-                        tokenizer = T5Tokenizer.from_pretrained(model_name, cache_dir=cache_dir,token=hf_token)
-                        model = T5ForConditionalGeneration.from_pretrained(
-                            model_name,
-                            cache_dir=cache_dir,
-                            torch_dtype=torch.float32,
-                            low_cpu_mem_usage=True
-                        )
-                    else:
-                        tokenizer = AutoTokenizer.from_pretrained(
-                            model_name,
-                            cache_dir=cache_dir,
-                            trust_remote_code=trust_remote,token=hf_token
-                        )
-                        
-                        # Ensure pad token is set
-                        if tokenizer.pad_token is None:
-                            tokenizer.pad_token = tokenizer.eos_token
-                        
-                        model = AutoModelForCausalLM.from_pretrained(
-                            model_name,
-                            cache_dir=cache_dir,
-                            torch_dtype=torch.float32,
-                            trust_remote_code=trust_remote,
-                            low_cpu_mem_usage=True,token=hf_token
-                        )
-                    
-                    # Move to appropriate device
-                    if torch.cuda.is_available():
-                        model = model.cuda()
-                    
-                    st.success(f"Successfully loaded {model_name}")
-                    return model, tokenizer
-                    
-                except Exception as e:
-                    if "429" in str(e) and attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        st.warning(f"Rate limited. Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-                    else:
-                        raise e
-                        
-        except Exception as e:
-            st.warning(f"Failed to load {model_name}: {str(e)[:100]}...")
-            continue
-    
-    st.error("Unable to load any model. Please check your internet connection or try again later.")
-    return None, None
+    """Load the Phi-3 model and tokenizer from Hugging Face"""
+    model_name = "microsoft/Phi-3-mini-4k-instruct"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto" if torch.cuda.is_available() else None,
+        trust_remote_code=True
+    )
+    return tokenizer, model
 
-def prepare_data_context(df: pd.DataFrame, max_rows: int = 50) -> str:
-    """Prepare a summary of the dataframe for LLM context"""
-    context = f"""
-    Dataset Overview:
-    - Total rows: {len(df)}
-    - Columns: {', '.join(df.columns.tolist())}
+# LLM Query Processing Functions
+def is_query_vague(query, tokenizer, model):
+    """Use LLM to determine if a query is vague or needs clarification"""
+    prompt = f"""<|system|>
+You are a helpful assistant that determines if a user query about data analysis is clear or vague.
+Respond with only "CLEAR" or "VAGUE" followed by a brief explanation.
+
+A query is CLEAR if it has specific filtering criteria, analysis type, or clear intent.
+A query is VAGUE if it lacks specifics about what data to look at or what analysis to perform.
+<|end|>
+<|user|>
+Query: "{query}"
+<|end|>
+<|assistant|>"""
     
-    Column Types and Sample Values:
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=100,
+            temperature=0.1,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    response_text = response.split("<|assistant|>")[-1].strip()
+    
+    return "VAGUE" in response_text.upper(), response_text
+
+def ask_for_clarification(query, tokenizer, model):
+    """Generate a clarification question for vague queries"""
+    prompt = f"""<|system|>
+You are a helpful assistant for a diamond inventory analysis system. 
+The user has asked a vague question and you need to ask for clarification.
+Ask a specific question to understand what they want to analyze.
+<|end|>
+<|user|>
+The user asked: "{query}"
+
+Generate a clarification question to understand their specific needs regarding:
+- Which time period (month/year/quarter)
+- Which product attributes (shape, color, bucket)
+- What type of analysis (pricing, inventory gaps, trends, etc.)
+<|end|>
+<|assistant|>"""
+    
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=150,
+            temperature=0.7,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response.split("<|assistant|>")[-1].strip()
+
+def process_data_query(query, df, tokenizer, model):
+    """Process user query against the data using LLM"""
+    # Get data info for context
+    columns = df.columns.tolist()
+    shape_keys = df['Shape key'].unique().tolist() if 'Shape key' in df.columns else []
+    color_keys = df['Color Key'].unique().tolist() if 'Color Key' in df.columns else []
+    buckets = df['Buckets'].unique().tolist() if 'Buckets' in df.columns else []
+    months = df['Month'].unique().tolist() if 'Month' in df.columns else []
+    years = df['Year'].unique().tolist() if 'Year' in df.columns else []
+    
+    # Create a summary of the data
+    data_summary = f"""
+    Columns: {', '.join(columns[:20])}...
+    Shape Keys: {', '.join(map(str, shape_keys[:10]))}
+    Color Keys: {', '.join(map(str, color_keys[:10]))}
+    Buckets: {', '.join(map(str, buckets[:10]))}
+    Months: {', '.join(map(str, months[:10]))}
+    Years: {', '.join(map(str, years[:10]))}
+    Total Records: {len(df)}
     """
     
-    for col in df.columns:
-        dtype = str(df[col].dtype)
-        unique_count = df[col].nunique()
-        
-        if df[col].dtype in ['object', 'category']:
-            unique_vals = df[col].value_counts().head(5).index.tolist()
-            context += f"\n- {col} ({dtype}): {unique_count} unique values. Top 5: {unique_vals}"
-        else:
-            context += f"\n- {col} ({dtype}): min={df[col].min()}, max={df[col].max()}, mean={df[col].mean():.2f}"
-    
-    # Add sample rows
-    context += f"\n\nSample of first {min(5, len(df))} rows:\n"
-    context += df.head(5).to_string()
-    
-    return context
+    prompt = f"""<|system|>
+You are a data analysis assistant for a diamond inventory system. 
+You help users filter and analyze data based on their queries.
+Generate Python code that will filter or analyze the dataframe based on the user's request.
+The dataframe is called 'df' and is already loaded.
 
-def generate_llm_response(model, tokenizer, prompt: str, max_length: int = 1000) -> str:
-    """Generate response from the LLM - handles different model types"""
+Available data context:
+{data_summary}
+
+Important columns for analysis:
+- Shape key: Diamond shape categories
+- Color Key: Color classifications
+- Buckets: Weight/size categories
+- Month, Year, Quarter: Time dimensions
+- Max Buying Price, Min Selling Price: Pricing data
+- Max Qty, Min Qty: Inventory limits
+- Weight, Product Id: Product details
+
+Return only executable Python code that:
+1. Filters the dataframe if needed
+2. Performs the requested analysis
+3. Returns results as 'result' variable (either a dataframe or a summary dict)
+<|end|>
+<|user|>
+{query}
+<|end|>
+<|assistant|>"""
+    
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=500,
+            temperature=0.1,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    code_response = response.split("<|assistant|>")[-1].strip()
+    
+    # Extract Python code from response
+    code_match = re.search(r'```python\n(.*?)\n```', code_response, re.DOTALL)
+    if code_match:
+        code = code_match.group(1)
+    else:
+        # If no code blocks, assume entire response is code
+        code = code_response
+    
+    return code
+
+def execute_llm_code(code, df):
+    """Safely execute the LLM-generated code"""
+    # Create a safe execution environment
+    safe_globals = {
+        'df': df,
+        'pd': pd,
+        'np': np,
+        'datetime': datetime,
+    }
+    
+    safe_locals = {}
+    
     try:
-        # Check model type
-        model_class = model.__class__.__name__
-        
-        if "T5" in model_class:
-            # T5 models use different generation
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-            if torch.cuda.is_available():
-                inputs = {k: v.cuda() for k, v in inputs.items()}
-            
-            outputs = model.generate(
-                **inputs,
-                max_length=max_length,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.95
-            )
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        else:
-            # GPT-style models
-            inputs = tokenizer.encode(prompt, return_tensors="pt", truncation=True, max_length=1000)
-            
-            if torch.cuda.is_available():
-                inputs = inputs.to("cuda")
-            
-            with torch.no_grad():
-                outputs = model.generate(
-                    inputs,
-                    max_length=max_length,
-                    temperature=0.7,
-                    do_sample=True,
-                    top_p=0.95,
-                    pad_token_id=tokenizer.eos_token_id
-                )
-            
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            # Remove the prompt from response
-            response = response.replace(prompt, "").strip()
-        
-        return response
+        exec(code, safe_globals, safe_locals)
+        result = safe_locals.get('result', None)
+        if result is None:
+            # Try to get any DataFrame variable
+            for var_name, var_value in safe_locals.items():
+                if isinstance(var_value, pd.DataFrame):
+                    result = var_value
+                    break
+        return result, None
     except Exception as e:
-        return f"Error generating response: {str(e)}"
+        return None, str(e)
 
-def analyze_query_intent(model, tokenizer, query: str) -> Tuple[bool, str]:
-    """Analyze if the query needs clarification"""
-    prompt = f"""<|system|>
-You are an assistant that analyzes user queries about diamond inventory data. Determine if the query is clear enough to answer or needs clarification.
-
-Respond with either:
-1. "CLEAR" if the query is specific enough to answer
-2. "NEEDS_CLARIFICATION: [specific question to ask user]" if the query is too vague
-
-Examples:
-- "Show me all data" -> NEEDS_CLARIFICATION: What specific information would you like to see? For example, would you like to filter by shape, color, bucket, or see summary statistics?
-- "What's the average cost for Cushion shape diamonds in Q1?" -> CLEAR
-- "Tell me about diamonds" -> NEEDS_CLARIFICATION: What specific aspect of diamonds would you like to know? I can provide information about shapes, colors, pricing, inventory levels, or trends.
-<|user|>
-{query}
-<|assistant|>"""
-    
-    response = generate_llm_response(model, tokenizer, prompt, max_length=200)
-    
-    if "NEEDS_CLARIFICATION:" in response:
-        return False, response.replace("NEEDS_CLARIFICATION:", "").strip()
+def generate_analysis_summary(query, result, tokenizer, model):
+    """Generate a natural language summary of the analysis results"""
+    if isinstance(result, pd.DataFrame):
+        result_summary = f"DataFrame with {len(result)} rows and {len(result.columns)} columns"
+        if len(result) > 0:
+            result_summary += f"\nFirst few rows:\n{result.head().to_string()}"
     else:
-        return True, ""
-
-def process_data_query(model, tokenizer, query: str, df: pd.DataFrame) -> Tuple[str, Optional[pd.DataFrame]]:
-    """Process the user query against the data"""
-    data_context = prepare_data_context(df)
+        result_summary = str(result)
     
     prompt = f"""<|system|>
-You are a data analyst assistant working with diamond inventory data. You have access to a dataset with the following structure:
-
-{data_context}
-
-Your tasks:
-1. Understand the user's query
-2. If they want filtered data, provide the Python code to filter the dataframe (variable name is 'df')
-3. If they want analysis, provide insights based on the data
-4. Always be specific and helpful
-
-Respond in this format:
-ANALYSIS: [Your analysis or explanation]
-FILTER_CODE: [Python code to filter df if needed, or 'None']
+You are a helpful assistant that summarizes data analysis results in clear, business-friendly language.
+<|end|>
 <|user|>
-{query}
+User Query: {query}
+
+Analysis Result:
+{result_summary}
+
+Provide a clear, concise summary of the findings.
+<|end|>
 <|assistant|>"""
     
-    response = generate_llm_response(model, tokenizer, prompt, max_length=800)
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
     
-    # Parse the response
-    analysis = ""
-    filter_code = None
-    filtered_df = None
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=300,
+            temperature=0.7,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
     
-    if "ANALYSIS:" in response:
-        parts = response.split("FILTER_CODE:")
-        analysis = parts[0].replace("ANALYSIS:", "").strip()
-        if len(parts) > 1:
-            filter_code = parts[1].strip()
-            if filter_code and filter_code.lower() != 'none':
-                try:
-                    # Execute the filter code safely
-                    local_vars = {'df': df, 'pd': pd, 'np': np}
-                    exec(f"filtered_df = {filter_code}", {"__builtins__": {}}, local_vars)
-                    filtered_df = local_vars.get('filtered_df', None)
-                except Exception as e:
-                    analysis += f"\n\nError applying filter: {str(e)}"
-    else:
-        analysis = response
-    
-    return analysis, filtered_df
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response.split("<|assistant|>")[-1].strip()
 
-# File history management functions (keep existing ones)
+# File history management functions (keeping existing functions)
 def get_history_file_path():
     """Get the path for the history JSON file"""
     history_dir = Path("history")
@@ -329,8 +296,8 @@ def display_upload_history():
         st.sidebar.markdown("---")
         st.sidebar.info("No upload history available")
 
-# Keep all existing functions (load_data, save_data, create_color_key, etc.)
-# ... [Include all the existing functions from the original code here] ...
+# [Keeping all existing functions from load_data through create_summary_charts - not repeating them here for brevity]
+# Include all functions from load_data to create_summary_charts from the original code
 
 def load_data(file):
     # Handle different input types
@@ -347,7 +314,11 @@ def load_data(file):
             df_dict = {}
             for sheet_name, df_ in df.items():
                 df_dict[sheet_name] = df_
+            # st.info(df.keys())
             return df_dict
+            
+            
+            
     else:
         # File object from Streamlit uploader
         if hasattr(file, 'name'):
@@ -360,6 +331,7 @@ def load_data(file):
             df_dict = {}
             for sheet_name, df_ in df.items():
                 df_dict[sheet_name] = df_
+            # st.info(df.keys())
             return df_dict
         elif file_type == 'pkl':
             df = pd.read_pickle(f"src/{file}")
@@ -367,13 +339,12 @@ def load_data(file):
         elif file_type == 'csv':
             return pd.read_csv(file)
 
+
 def save_data(df):
     df.to_pickle('src/kunmings.pkl')
-
 def create_color_key(df,color_map):
     df['Color Key'] = df.Color.map(lambda x: color_map[x] if x in color_map else '')
     return df
-
 def create_bucket(df,stock_bucket=stock_bucket):
     """
     df : Monthly Stock Data Sheet
@@ -400,7 +371,6 @@ def create_date_join(df):
     df['Year'] = pd.to_datetime('today').year
     df['Join'] = df['Month'].astype(str) + '-' + df['Year'].map(lambda x: x-2000).astype(str)
     return df
-
 def concatenate_first_two_rows(df):
     result = {}
     for col in df.columns:
@@ -408,7 +378,6 @@ def concatenate_first_two_rows(df):
         value2 = str(df.iloc[1][col])
         result[col] = f"{value1}_{value2}"
     return result
-
 def populate_max_qty(df,MONTHLY_STOCK_DATA):
     """
     df : Max Qty Sheet
@@ -468,7 +437,6 @@ def populate_min_qty(df,MONTHLY_STOCK_DATA):
     MONTHLY_STOCK_DATA['Min Qty'] = _MIN_QTY_
     MONTHLY_STOCK_DATA['Min Qty']=MONTHLY_STOCK_DATA['Min Qty'].map(lambda x:x[0] if isinstance(x, list) and len(x) > 0 else 0)
     return MONTHLY_STOCK_DATA
-
 def populate_selling_prices(df,MONTHLY_STOCK_DATA):
     """
     df : Buying Max Prices Sheet 
@@ -499,7 +467,6 @@ def populate_selling_prices(df,MONTHLY_STOCK_DATA):
     MONTHLY_STOCK_DATA['Min Selling Price']=MONTHLY_STOCK_DATA['Min Selling Price'].map(lambda x: x[0] if (isinstance(x,list) and len(x)>0) else 0)
     MONTHLY_STOCK_DATA['Min Selling Price'] = MONTHLY_STOCK_DATA['Max Buying Price'] * MONTHLY_STOCK_DATA['Min Selling Price'] 
     return MONTHLY_STOCK_DATA
-
 def populate_buying_prices(df,MONTHLY_STOCK_DATA):
     """
     df : Buying Max Prices Sheet 
@@ -529,7 +496,6 @@ def populate_buying_prices(df,MONTHLY_STOCK_DATA):
     MONTHLY_STOCK_DATA['Max Buying Price'] = _BUYING_PRICE_
     MONTHLY_STOCK_DATA['Max Buying Price']=MONTHLY_STOCK_DATA['Max Buying Price'].map(lambda x:x[0] if isinstance(x, list) and len(x) > 0 else 0)
     return MONTHLY_STOCK_DATA
-
 def calculate_buying_price_avg(df):
     df['Buying Price Avg'] = df['Max Buying Price'] * df['Weight']
     return df
@@ -554,14 +520,12 @@ def get_quarter(month):
         return f'Q4-{yr}'
     else:
         return None
-
 def populate_quarter(df):
     """
     df : Monthly Stock Data Sheet
     """
     df['Quarter'] = df['Month'].apply(get_quarter)
     return df
-
 def create_shape_key(x):
     if x.__contains__(r'HEART'):
         return 'Other'
@@ -577,6 +541,7 @@ def create_shape_key(x):
         return 'Cushion'
     elif x.__contains__(r'MODIFIED SQUARE'):
         return 'Cushion'
+    
     elif x.__contains__(r'MARQUISE MODIFIED'):
         return 'Other'
     elif x.__contains__(r'ROUND_CORNERED'):
@@ -585,7 +550,6 @@ def create_shape_key(x):
         return 'Other'
     else:
         return 'Other'
-
 def poplutate_monthly_stock_sheet(file):
     """
     df_stock : Monthly Stock Data Sheet
@@ -616,26 +580,46 @@ def poplutate_monthly_stock_sheet(file):
     df_stock = populate_selling_prices(df_min_sp,df_stock)
     df_stock.fillna(0,inplace=True)
     return df_stock
-
 def calculate_qoq_variance_percentage(current_quarter_price, previous_quarter_price):
     """
     Calculate quarter-on-quarter variance percentage of price.
+    
+    Args:
+        current_quarter_price (float): Price for the current quarter
+        previous_quarter_price (float): Price for the previous quarter
+    
+    Returns:
+        float: Variance percentage (positive for increase, negative for decrease)
+        
+    Raises:
+        ValueError: If previous quarter price is zero or negative
+        TypeError: If inputs are not numeric
     """
+    # Input validation
     if not isinstance(current_quarter_price, (int, float)) or not isinstance(previous_quarter_price, (int, float)):
         raise TypeError("Both prices must be numeric values")
     
     if previous_quarter_price <= 0:
         variance_percentage = 0.00001
+        # raise ValueError("Previous quarter price must be positive (cannot be zero or negative)")
     
+    # Calculate variance percentage
     if previous_quarter_price !=0:
         variance_percentage = ((current_quarter_price - previous_quarter_price) / previous_quarter_price) * 100
     else:
         variance_percentage = ((current_quarter_price - previous_quarter_price) / (previous_quarter_price+current_quarter_price)) * 100
     return round(variance_percentage, 2)
 
+
 def calculate_qoq_variance_series(price_data):
     """
     Calculate quarter-on-quarter variance for a series of quarterly prices.
+    
+    Args:
+        price_data (list): List of quarterly prices in chronological order
+    
+    Returns:
+        list: List of QoQ variance percentages (starts from Q2 since Q1 has no previous quarter)
     """
     if len(price_data) < 2:
         raise ValueError("Need at least 2 quarters of data to calculate variance")
@@ -646,7 +630,6 @@ def calculate_qoq_variance_series(price_data):
         variances.append(variance)
     
     return variances
-
 def monthly_variance(df,col):
     analysis=df.groupby(['Month','Year'],as_index=False)[col].sum()
     analysis['Num_Month'] = analysis['Month'].map(month_map)
@@ -654,7 +637,6 @@ def monthly_variance(df,col):
     analysis['Monthly_change']=analysis[col].pct_change().fillna(0).round(2)*100
     analysis['qaurter_change']=[0]+calculate_qoq_variance_series(analysis[col].tolist())
     return analysis
-
 def gap_analysis(max_qty,min_qty,stock_in_hand):
     """
     max_qty : Maximum Quantity
@@ -684,6 +666,18 @@ def get_filtered_data(FILTER_MONTH,FILTE_YEAR,FILTER_SHAPE,FILTER_COLOR,FILTER_B
     master_df = load_data('kunmings.pkl')
     if (type(FILTE_YEAR)==str) & (str(FILTE_YEAR).isnumeric()):
         FILTE_YEAR = int(FILTE_YEAR)
+    #     FILTE_YEAR = int(FILTE_YEAR)
+    #     filter_data=master_df[(master_df['Month'] == FILTER_MONTH) | \
+    #                                   (master_df['Year'] == FILTE_YEAR) | \
+    #                                     (master_df['Shape key'] == FILTER_SHAPE) |\
+    #                                     (master_df['Color Key'] == FILTER_COLOR) |\
+    #                                     (master_df['Buckets'] == FILTER_BUCKET)]
+    # else:
+    #     filter_data=master_df[(master_df['Month'] == FILTER_MONTH) | \
+                                      
+    #                                     (master_df['Shape key'] == FILTER_SHAPE) |\
+    #                                     (master_df['Color Key'] == FILTER_COLOR) |\
+    #                                     (master_df['Buckets'] == FILTER_BUCKET)]
     filter_data=master_df[(master_df['Month'] == FILTER_MONTH) & \
                                       (master_df['Year'] == FILTE_YEAR) & \
                                         (master_df['Shape key'] == FILTER_SHAPE) &\
@@ -700,10 +694,18 @@ def get_filtered_data(FILTER_MONTH,FILTE_YEAR,FILTER_SHAPE,FILTER_COLOR,FILTER_B
         max_buying_price = filter_data['Max Buying Price'].max()
         current_avg_cost = (sum(filter_data['Avg Cost Total'])/(filter_data['Weight'].sum() if filter_data['Weight'].sum() != 0 else 1))*.9
         min_selling_price = filter_data['Min Selling Price'].min()
+        # avg_value = _filter_[FILTER_MONTHLY_VAR_COL].mean()
+        # MOM_Variance = (sum((filter_data[FILTER_MONTHLY_VAR_COL] - avg_value)/ avg_value )/filter_data.shape[0]) * 100
+        # var_analysis = monthly_variance(_filter_,FILTER_MONTHLY_VAR_COL)
+        # MOM_Percent_Change = var_analysis[(var_analysis['Month'] == FILTER_MONTH) & (var_analysis['Year'] == FILTE_YEAR)]['Monthly_change'].values.tolist()[0]
+        # MOM_QoQ_Percent_Change = var_analysis[(var_analysis['Month'] == FILTER_MONTH) & (var_analysis['Year'] == FILTE_YEAR)]['qaurter_change'].values.tolist()[0]
+        # if MOM_Percent_Change == np.inf:
+        #     MOM_Percent_Change = 0
+        # if MOM_QoQ_Percent_Change == np.inf:
+        #     MOM_QoQ_Percent_Change = 0
         return [filter_data,int(max_buying_price),int(current_avg_cost), gap_analysis_op,min_selling_price]
     except:
         return [pd.DataFrame(columns=master_df.columns.tolist()),f"There is {filter_data.shape[0]} rows after filter",f"There is {filter_data.shape[0]} rows after filter",gap_analysis_op,0]
-
 def get_summary_metrics(filter_data,Filter_Month,FILTER_SHAPE,FILTE_YEAR,FILTER_COLOR,FILTER_BUCKET,FILTER_MONTHLY_VAR_COL):
     FILTE_YEAR = int(FILTE_YEAR)
     master_df = load_data('kunmings.pkl')
@@ -766,9 +768,11 @@ def get_summary_metrics(filter_data,Filter_Month,FILTER_SHAPE,FILTE_YEAR,FILTER_
             return [MOM_Variance, MOM_Percent_Change, MOM_QoQ_Percent_Change]
         else:
             return [0,0,0]
+            
     except:
         return [0,0,0]
-
+        
+    
 def get_gap_summary_table(master_df, selected_month, selected_year, selected_shape, selected_color, selected_bucket):
     """
     Generate GAP summary table for all combinations of filter values
@@ -825,10 +829,15 @@ def get_final_data(file,PARENT_DF = 'kunmings.pkl'):
     master_df = master_df.drop_duplicates(subset='Product Id')
     save_data(master_df)
     return master_df
-
 def sort_months(months):
     """
     Sort months supporting both full names and abbreviations.
+    
+    Args:
+        months: List of month names (full names or abbreviations)
+    
+    Returns:
+        List of months sorted in chronological order
     """
     import calendar
     
@@ -847,10 +856,19 @@ def sort_months(months):
     sorted_months = sorted(months, key=lambda month: month_mapping.get(month, 13))
     
     return sorted_months
-
 def create_trend_visualization(master_df, selected_shape=None, selected_color=None, selected_bucket=None, selected_variance_column=None):
     """
     Create trend line visualizations for MOM Variance and MOM QoQ Percent Change
+    
+    Args:
+        master_df: Master dataframe containing all data
+        selected_shape: Selected shape filter
+        selected_color: Selected color filter  
+        selected_bucket: Selected bucket filter
+        selected_variance_column: Column to calculate variance for
+    
+    Returns:
+        plotly figure object
     """
     
     # Filter data based on selections
@@ -880,7 +898,8 @@ def create_trend_visualization(master_df, selected_shape=None, selected_color=No
         variance_col = 'Buying Price Avg'
     elif variance_col == 'None' or variance_col == None:
         variance_col = 'Max Buying Price' # Default column
-    
+    # monthly_variance
+    # Calculate monthly variance data
     try:
         var_analysis = monthly_variance(filtered_df, variance_col)
         
@@ -994,6 +1013,15 @@ def create_trend_visualization(master_df, selected_shape=None, selected_color=No
 def create_summary_charts(master_df, selected_shape, selected_color, selected_bucket):
     """
     Create summary charts showing overall trends across all months/years
+    
+    Args:
+        master_df: Master dataframe
+        selected_shape: Selected shape filter
+        selected_color: Selected color filter
+        selected_bucket: Selected bucket filter
+    
+    Returns:
+        plotly figure object
     """
     
     # Filter data
@@ -1127,69 +1155,80 @@ def main():
         st.session_state.upload_history = load_upload_history()
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
-    if 'llm_model' not in st.session_state:
-        with st.spinner("Loading AI model... This may take a few moments on first run."):
-            model, tokenizer = load_llm_model()
-            st.session_state.llm_model = model
-            st.session_state.llm_tokenizer = tokenizer
+    if 'awaiting_clarification' not in st.session_state:
+        st.session_state.awaiting_clarification = False
+    if 'original_query' not in st.session_state:
+        st.session_state.original_query = ""
+        
+    # Load LLM model
+    with st.spinner("Loading AI Model..."):
+        tokenizer, model = load_llm_model()
     
-    # Create tabs for different functionalities
-    tab1, tab2 = st.tabs(["📊 Dashboard", "🤖 AI Assistant"])
+    # Sidebar for controls
+    st.sidebar.header("Controls")
+    # File upload
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload Excel File",
+        type=['xlsx', 'xls'],
+        help="Upload an Excel file with multiple sheets"
+    )
     
-    with tab1:
-        # Sidebar for controls
-        st.sidebar.header("Controls")
+    # Display upload history
+    display_upload_history()
+    
+    # Main content area
+    if uploaded_file is not None and not st.session_state.data_processed:
+        with st.spinner("Processing Excel file..."):
+            try:
+                # Get file size
+                file_size = uploaded_file.size if hasattr(uploaded_file, 'size') else None
+                
+                # Process the file
+                st.subheader("🗄️ Master Database")
+                st.session_state.master_df = get_final_data(uploaded_file)
+                st.session_state.data_processed = True
+                
+                # Add to upload history after successful processing
+                st.session_state.upload_history = add_to_upload_history(
+                    filename=uploaded_file.name,
+                    file_size=file_size
+                )
+                
+                # Show success message
+                st.success(f"✅ Successfully processed: {uploaded_file.name}")
+                
+                # Force sidebar refresh to show updated history
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"Error processing file: {str(e)}")
+                # Still add to history but mark as failed
+                history = load_upload_history()
+                new_entry = {
+                    "filename": uploaded_file.name,
+                    "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "file_size": uploaded_file.size if hasattr(uploaded_file, 'size') else None,
+                    "status": "Failed"
+                }
+                history.insert(0, new_entry)
+                history = history[:10]
+                save_upload_history(history)
+                st.session_state.upload_history = history
+    
+    # Try to load existing data if available
+    if st.session_state.master_df.empty:
+        try:
+            st.session_state.master_df = load_data('kunmings.pkl')
+            st.session_state.data_processed = True
+        except:
+            pass
+    
+    if not st.session_state.master_df.empty:
+        # Create tabs for different functionalities
+        tab1, tab2 = st.tabs(["📊 Manual Filtering & Analysis", "🤖 AI Query Assistant"])
         
-        # File upload
-        uploaded_file = st.sidebar.file_uploader(
-            "Upload Excel File",
-            type=['xlsx', 'xls'],
-            help="Upload an Excel file with multiple sheets"
-        )
-        
-        # Display upload history
-        display_upload_history()
-        
-        # Main content area
-        if uploaded_file is not None and not st.session_state.data_processed:
-            with st.spinner("Processing Excel file..."):
-                try:
-                    # Get file size
-                    file_size = uploaded_file.size if hasattr(uploaded_file, 'size') else None
-                    
-                    # Process the file
-                    st.subheader("🗄️ Master Database")
-                    st.session_state.master_df = get_final_data(uploaded_file)
-                    st.session_state.data_processed = True
-                    
-                    # Add to upload history after successful processing
-                    st.session_state.upload_history = add_to_upload_history(
-                        filename=uploaded_file.name,
-                        file_size=file_size
-                    )
-                    
-                    # Show success message
-                    st.success(f"✅ Successfully processed: {uploaded_file.name}")
-                    
-                    # Force sidebar refresh to show updated history
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Error processing file: {str(e)}")
-                    # Still add to history but mark as failed
-                    history = load_upload_history()
-                    new_entry = {
-                        "filename": uploaded_file.name,
-                        "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "file_size": uploaded_file.size if hasattr(uploaded_file, 'size') else None,
-                        "status": "Failed"
-                    }
-                    history.insert(0, new_entry)
-                    history = history[:10]
-                    save_upload_history(history)
-                    st.session_state.upload_history = history
-        
-        if not st.session_state.master_df.empty or uploaded_file is not None:
+        with tab1:
+            # Existing filtering functionality
             Month,Year,Shape,Color,Bucket,Variance_Column = st.columns(6)
             with Month:
                 categories = ["None"]+sort_months(list(st.session_state.master_df['Month'].unique()))
@@ -1210,7 +1249,7 @@ def main():
                 variance_columns = ["None"]+['Current Average Cost','Max Buying Price','Min Selling Price']
                 selected_variance_column = st.selectbox("Select Variance Column", variance_columns)
             
-            # Apply filters
+            # Apply filters and show results (existing code)
             filtered_df = st.session_state.master_df.copy()
             if ((selected_month != "None") & (selected_year != "None") & (selected_shape != "None") & (selected_color != "None") & (selected_bucket != "None")) :
                 filter_data,max_buying_price,current_avg_cost,gap_output,min_selling_price = get_filtered_data(selected_month,\
@@ -1257,7 +1296,6 @@ def main():
                         st.metric("MOM QoQ Percent Change", f"0")
                         
                     st.subheader("No Data Present for This Filter")
-                
                 # Add visualization section
                 st.subheader("📈 Trend Analysis")
                 
@@ -1305,7 +1343,6 @@ def main():
                     }
                 </style>
                 """, unsafe_allow_html=True)
-                
                 viz_tab1, viz_tab2 = st.tabs(["📊 Variance Trends", "📈 Summary Analytics"])
                 with viz_tab1:
                     if selected_variance_column != "None":
@@ -1337,6 +1374,7 @@ def main():
                         )
                 # Download processed data
                 st.subheader("💾 Download Filtered Data")
+                # filter_data['Avg Cost Total'] = filter_data['avg']
                 csv = filter_data.loc[:,['Product Id','Shape key','Color Key','Avg Cost Total','Min Qty','Max Qty','Buying Price Avg','Max Buying Price']].to_csv(index=False)
                 st.download_button(
                 label="Download Filtered Data as CSV",
@@ -1365,7 +1403,12 @@ def main():
             )
             
             if not gap_summary_df.empty:
-                # Apply styling to highlight shape gap
+                # Apply styling to highlight negative GAP values in red
+                def highlight_negative_gap(row):
+                    if row['GAP Value'] < 0:
+                        return ['background-color: #ffebee; color: #c62828'] * len(row)
+                    else:
+                        return [''] * len(row)
                 def highlight_shape_gap(row):
                     if row['GAP Value'] < 0:
                         return ['background-color: #ffebee; color: #c62828'] * len(row)
@@ -1383,6 +1426,7 @@ def main():
                         else:
                             return [''] * len(row)
                 styled_df = gap_summary_df.style.apply(highlight_shape_gap, axis=1)
+                # styled_df = gap_summary_df.style.apply(highlight_negative_gap, axis=1)
                 
                 st.dataframe(
                     styled_df,
@@ -1419,138 +1463,110 @@ def main():
                 
             if not ((selected_month != "None") & (selected_year != "None") & (selected_shape != "None") & (selected_color != "None") & (selected_bucket != "None")):
                 st.info("Please select all filter values except 'Select Variance Column' to view detailed metrics.")
+        
+        with tab2:
+            st.subheader("🤖 AI Query Assistant")
+            st.markdown("Ask questions about your data in natural language!")
             
-        else:
-            st.info("No data in master database. Upload an Excel file to get started!")
-        
-        # Reset button
-        if st.sidebar.button("Reset Data Processing"):
-            st.session_state.data_processed = False
-            st.session_state.master_df = pd.DataFrame()
-            st.rerun()
-        
-        # Clear history button
-        if st.sidebar.button("Clear Upload History"):
-            save_upload_history([])
-            st.session_state.upload_history = []
-            st.success("Upload history cleared!")
-            st.rerun()
-    
-    with tab2:
-        st.header("🤖 AI Assistant for Diamond Data Analysis")
-        
-        # Check if data is loaded
-        if st.session_state.master_df.empty:
-            # Try to load from pickle file
-            try:
-                st.session_state.master_df = load_data('kunmings.pkl')
-                st.success("Loaded existing diamond data from database.")
-            except:
-                st.warning("Please upload data in the Dashboard tab or ensure 'kunmings.pkl' exists.")
-                return
-        
-        # Check if model is loaded
-        if st.session_state.llm_model is None or st.session_state.llm_tokenizer is None:
-            st.error("AI model failed to load. Please check your internet connection and try refreshing the page.")
-            return
-        
-        # Chat interface
-        st.markdown("Ask me anything about your diamond inventory data!")
-        
-        # Display chat history
-        for message in st.session_state.chat_history:
-            with st.chat_message(message["role"]):
-                st.write(message["content"])
-                if "data" in message and message["data"] is not None:
-                    st.dataframe(message["data"], use_container_width=True)
-        
-        # User input
-        user_query = st.chat_input("Type your question here...")
-        
-        if user_query:
-            # Add user message to chat history
-            st.session_state.chat_history.append({"role": "user", "content": user_query})
-            
-            with st.chat_message("user"):
-                st.write(user_query)
-            
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    # Check if query needs clarification
-                    is_clear, clarification = analyze_query_intent(
-                        st.session_state.llm_model,
-                        st.session_state.llm_tokenizer,
-                        user_query
-                    )
-                    
-                    if not is_clear:
-                        st.write(clarification)
-                        st.session_state.chat_history.append({
-                            "role": "assistant",
-                            "content": clarification
-                        })
+            # Display chat history
+            for message in st.session_state.chat_history:
+                with st.chat_message(message["role"]):
+                    if message["role"] == "assistant" and isinstance(message["content"], pd.DataFrame):
+                        st.dataframe(message["content"])
                     else:
-                        # Process the query
-                        analysis, filtered_data = process_data_query(
-                            st.session_state.llm_model,
-                            st.session_state.llm_tokenizer,
-                            user_query,
-                            st.session_state.master_df
-                        )
-                        
-                        st.write(analysis)
-                        
-                        # Display filtered data if available
-                        if filtered_data is not None and not filtered_data.empty:
-                            st.dataframe(filtered_data, use_container_width=True)
+                        st.write(message["content"])
+            
+            # Query input
+            user_query = st.chat_input("Ask about your data (e.g., 'Show me all Cushion diamonds from January 2024')")
+            
+            if user_query:
+                # Add user message to chat
+                st.session_state.chat_history.append({"role": "user", "content": user_query})
+                
+                with st.chat_message("user"):
+                    st.write(user_query)
+                
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        # Check if this is a clarification response
+                        if st.session_state.awaiting_clarification:
+                            # Combine original query with clarification
+                            full_query = f"{st.session_state.original_query}. {user_query}"
+                            st.session_state.awaiting_clarification = False
+                        else:
+                            full_query = user_query
                             
-                            # Option to download filtered data
-                            csv = filtered_data.to_csv(index=False)
-                            st.download_button(
-                                label="Download AI-filtered data as CSV",
-                                data=csv,
-                                file_name=f"ai_filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                mime="text/csv"
-                            )
+                        # Check if query is vague
+                        is_vague, vague_response = is_query_vague(full_query, tokenizer, model)
                         
-                        # Add to chat history
-                        st.session_state.chat_history.append({
-                            "role": "assistant",
-                            "content": analysis,
-                            "data": filtered_data
-                        })
-        
-        # Clear chat button
-        if st.button("Clear Chat History"):
-            st.session_state.chat_history = []
-            st.rerun()
-        
-        # Examples section
-        with st.expander("Example Questions"):
-            st.markdown("""
-            Here are some example questions you can ask:
+                        if is_vague and not st.session_state.awaiting_clarification:
+                            # Ask for clarification
+                            clarification = ask_for_clarification(full_query, tokenizer, model)
+                            st.write(clarification)
+                            st.session_state.chat_history.append({"role": "assistant", "content": clarification})
+                            st.session_state.awaiting_clarification = True
+                            st.session_state.original_query = user_query
+                        else:
+                            # Process the query
+                            code = process_data_query(full_query, st.session_state.master_df, tokenizer, model)
+                            
+                            # Execute the code
+                            result, error = execute_llm_code(code, st.session_state.master_df)
+                            
+                            if error:
+                                st.error(f"Error executing analysis: {error}")
+                                st.code(code, language='python')
+                                st.session_state.chat_history.append({"role": "assistant", "content": f"Error: {error}"})
+                            else:
+                                # Generate summary
+                                summary = generate_analysis_summary(full_query, result, tokenizer, model)
+                                st.write(summary)
+                                
+                                # Display results
+                                if isinstance(result, pd.DataFrame):
+                                    st.dataframe(result)
+                                    
+                                    # Offer download
+                                    csv = result.to_csv(index=False)
+                                    st.download_button(
+                                        label="Download Results as CSV",
+                                        data=csv,
+                                        file_name=f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                        mime="text/csv"
+                                    )
+                                elif result is not None:
+                                    st.write(result)
+                                
+                                # Add to chat history
+                                st.session_state.chat_history.append({"role": "assistant", "content": summary})
+                                if isinstance(result, pd.DataFrame):
+                                    st.session_state.chat_history.append({"role": "assistant", "content": result})
             
-            **Data Exploration:**
-            - What shapes of diamonds do we have in inventory?
-            - Show me all Cushion shape diamonds with FLY color
-            - What's the average cost for Oval diamonds in bucket B1?
-            
-            **Filtering:**
-            - Filter diamonds with weight greater than 2 carats
-            - Show me all diamonds from January 2024
-            - Find diamonds with max buying price above $5000
-            
-            **Analysis:**
-            - What's the trend in average costs over the past months?
-            - Which shape has the highest average price?
-            - Calculate the total inventory value by shape
-            - What's our gap analysis for Cushion FLY diamonds?
-            
-            **Complex Queries:**
-            - Compare prices between different shapes in Q1 2024
-            - Which color-shape combination has the best margin?
-            - Show me underperforming inventory items
-            """)
-
+            # Clear chat button
+            if st.button("Clear Chat History"):
+                st.session_state.chat_history = []
+                st.session_state.awaiting_clarification = False
+                st.session_state.original_query = ""
+                st.rerun()
+                
+    else:
+        st.info("No data in master database. Upload an Excel file to get started!")
+    
+    # Reset button
+    if st.sidebar.button("Reset Data Processing"):
+        st.session_state.data_processed = False
+        st.session_state.master_df = pd.DataFrame()
+        st.session_state.chat_history = []
+        st.session_state.awaiting_clarification = False
+        st.session_state.original_query = ""
+        st.rerun()
+    
+    # Clear history button
+    if st.sidebar.button("Clear Upload History"):
+        save_upload_history([])
+        st.session_state.upload_history = []
+        st.success("Upload history cleared!")
+        st.rerun()
+    
 if __name__ == "__main__":
     main()
