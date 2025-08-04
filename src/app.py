@@ -14,19 +14,27 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import gc
+import warnings
 
 # Initialize Phi-3 model and tokenizer
 @st.cache_resource
 def load_llm_model():
     """Load the Phi-3 model and tokenizer"""
     try:
+        # Suppress warnings before loading model
+        import warnings
+        warnings.filterwarnings('ignore')
+        
         model_name = "microsoft/Phi-3-mini-4k-instruct"
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        
+        # Model configuration without flash attention
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True
+            trust_remote_code=True,
+            use_flash_attention_2=False  # Explicitly disable flash attention
         )
         if not torch.cuda.is_available():
             model = model.to("cpu")
