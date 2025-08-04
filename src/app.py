@@ -1,3 +1,27 @@
+"""
+Yellow Diamond Dashboard with AI Query Assistant
+
+This application uses:
+1. Qwen2-1.5B-Instruct (default) or Qwen3-30B-A3B-Instruct for all AI tasks
+2. Optionally Flan-T5-base for lightweight intent detection (if use_qwen_for_all=False)
+
+Installation Requirements:
+pip install streamlit pandas numpy plotly transformers torch accelerate
+
+Configuration Options (see MODEL_CONFIG below):
+- use_large_qwen: False (default) uses Qwen2-1.5B, True uses Qwen3-30B
+- device_map: "auto" for GPU, "cpu" for CPU-only deployment
+- torch_dtype: torch.float16 for GPU, torch.float32 for CPU
+- use_qwen_for_all: True (default) uses Qwen for all tasks, False uses mixed approach
+
+Model Comparison:
+- Qwen2-1.5B: Fast, requires ~3GB memory, good for most queries
+- Qwen3-30B: More accurate, requires >40GB GPU memory, slower response times
+
+For production deployment, Qwen2-1.5B is recommended unless you have
+dedicated GPU infrastructure for the larger model.
+"""
+
 import pandas as pd
 import numpy as np
 from typing import Dict, Optional, List, Tuple
@@ -13,14 +37,21 @@ import os
 from pathlib import Path
 import torch
 from transformers import (
-    TapasTokenizer, 
-    TapasForQuestionAnswering,
     AutoTokenizer,
+    AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
     pipeline
 )
 import warnings
 warnings.filterwarnings('ignore')
+
+# Configuration - Change these settings based on your hardware
+MODEL_CONFIG = {
+    "use_large_qwen": False,  # Set to True to use Qwen3-30B (requires >40GB GPU)
+    "device_map": "auto",     # "auto" for GPU, "cpu" for CPU-only
+    "torch_dtype": torch.float16,  # Use float32 for CPU
+    "use_qwen_for_clarity": True,  # Use Qwen for clarity checking instead of Flan-T5
+}
 
 # File history management functions
 def get_history_file_path():
@@ -98,49 +129,104 @@ def display_upload_history():
 def load_models():
     """Load and cache the ML models"""
     try:
-        # Load TAPAS for table QA
-        tapas_tokenizer = TapasTokenizer.from_pretrained("google/tapas-base-finetuned-wikisql-supervised")
-        tapas_model = TapasForQuestionAnswering.from_pretrained("google/tapas-base-finetuned-wikisql-supervised")
+        # Choose Qwen model based on configuration
+        if MODEL_CONFIG["use_large_qwen"]:
+            qwen_model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+            st.info("Loading Qwen3-30B model... This may take a while and requires significant GPU memory.")
+        else:
+            qwen_model_name = "Qwen/Qwen2-1.5B-Instruct"
+            st.info("Loading Qwen2-1.5B model for efficient deployment...")
         
-        # Load Flan-T5 for intent detection and conversation
-        flan_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
-        flan_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+        # Load Qwen for table QA and general understanding
+        qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_model_name)
+        qwen_model = AutoModelForCausalLM.from_pretrained(
+            qwen_model_name,
+            torch_dtype=MODEL_CONFIG["torch_dtype"],
+            device_map=MODEL_CONFIG["device_map"]
+        )
         
-        return {
-            'tapas': {'tokenizer': tapas_tokenizer, 'model': tapas_model},
-            'flan': {'tokenizer': flan_tokenizer, 'model': flan_model}
+        models_dict = {
+            'qwen': {'tokenizer': qwen_tokenizer, 'model': qwen_model}
         }
+        
+        # Load Flan-T5 only if not using Qwen for all tasks
+        if not MODEL_CONFIG["use_qwen_for_all"]:
+            st.info("Loading Flan-T5 for intent detection...")
+            flan_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+            flan_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+            models_dict['flan'] = {'tokenizer': flan_tokenizer, 'model': flan_model}
+        
+        st.success("Models loaded successfully!")
+        
+        return models_dict
     except Exception as e:
         st.error(f"Error loading models: {str(e)}")
         return None
 
 # LLM Query Processing Functions
-def check_query_clarity(query: str, models: dict) -> Tuple[bool, str]:
+def check_query_clarity(query: str, models: dict, use_qwen: bool = False) -> Tuple[bool, str]:
     """
-    Use Flan-T5 to check if query is clear or needs clarification
+    Check if query is clear or needs clarification
+    Can use either Flan-T5 or Qwen based on preference
     Returns: (is_clear, clarification_request)
     """
-    flan_tokenizer = models['flan']['tokenizer']
-    flan_model = models['flan']['model']
-    
-    prompt = f"""Analyze if this query about diamond inventory data is clear and specific enough to answer:
-    Query: "{query}"
-    
-    If the query is clear and specific, respond with "CLEAR".
-    If the query is vague or needs more information, respond with "CLARIFY: [specific question to ask user]"
-    
-    Examples:
-    - "Show me diamonds" -> "CLARIFY: What specific attributes of diamonds would you like to see? (e.g., shape, color, price range, weight)"
-    - "What is the average price of cushion cut diamonds in bucket A?" -> "CLEAR"
-    - "Analysis" -> "CLARIFY: What type of analysis would you like? (e.g., price trends, inventory gaps, color distribution)"
-    
-    Response:"""
-    
-    inputs = flan_tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
-    with torch.no_grad():
-        outputs = flan_model.generate(**inputs, max_length=100, temperature=0.7)
-    
-    response = flan_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    if use_qwen and 'qwen' in models:
+        # Use Qwen for clarity checking
+        qwen_tokenizer = models['qwen']['tokenizer']
+        qwen_model = models['qwen']['model']
+        
+        messages = [
+            {"role": "system", "content": "You are analyzing queries about diamond inventory data. Determine if the query is clear enough to answer."},
+            {"role": "user", "content": f"""Analyze if this query is clear and specific enough to answer:
+Query: "{query}"
+
+If the query is clear and specific, respond with just "CLEAR".
+If the query is vague or needs more information, respond with "CLARIFY: [specific question to ask user]"
+
+Examples:
+- "Show me diamonds" -> "CLARIFY: What specific attributes of diamonds would you like to see? (e.g., shape, color, price range, weight)"
+- "What is the average price of cushion cut diamonds in bucket A?" -> "CLEAR"
+- "Analysis" -> "CLARIFY: What type of analysis would you like? (e.g., price trends, inventory gaps, color distribution)"
+
+Response:"""}
+        ]
+        
+        text = qwen_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model_inputs = qwen_tokenizer([text], return_tensors="pt").to(qwen_model.device)
+        
+        with torch.no_grad():
+            generated_ids = qwen_model.generate(
+                model_inputs.input_ids,
+                max_new_tokens=50,
+                temperature=0.3,
+                do_sample=True
+            )
+        
+        generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)]
+        response = qwen_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    else:
+        # Use Flan-T5 (default)
+        flan_tokenizer = models['flan']['tokenizer']
+        flan_model = models['flan']['model']
+        
+        prompt = f"""Analyze if this query about diamond inventory data is clear and specific enough to answer:
+Query: "{query}"
+
+If the query is clear and specific, respond with "CLEAR".
+If the query is vague or needs more information, respond with "CLARIFY: [specific question to ask user]"
+
+Examples:
+- "Show me diamonds" -> "CLARIFY: What specific attributes of diamonds would you like to see? (e.g., shape, color, price range, weight)"
+- "What is the average price of cushion cut diamonds in bucket A?" -> "CLEAR"
+- "Analysis" -> "CLARIFY: What type of analysis would you like? (e.g., price trends, inventory gaps, color distribution)"
+
+Response:"""
+        
+        inputs = flan_tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+        with torch.no_grad():
+            outputs = flan_model.generate(**inputs, max_length=100, temperature=0.7)
+        
+        response = flan_tokenizer.decode(outputs[0], skip_special_tokens=True)
     
     if response.strip().upper().startswith("CLEAR"):
         return True, ""
@@ -150,40 +236,79 @@ def check_query_clarity(query: str, models: dict) -> Tuple[bool, str]:
         # Fallback if model doesn't follow format
         return True, ""
 
-def extract_query_intent(query: str, models: dict) -> dict:
+def extract_query_intent(query: str, models: dict, use_qwen: bool = False) -> dict:
     """
-    Use Flan-T5 to extract intent and parameters from query
+    Extract intent and parameters from query using either Flan-T5 or Qwen
     """
-    flan_tokenizer = models['flan']['tokenizer']
-    flan_model = models['flan']['model']
-    
-    prompt = f"""Extract the intent and filters from this diamond inventory query:
-    Query: "{query}"
-    
-    Identify:
-    1. Action type: (filter/aggregate/analyze/compare)
-    2. Filters: shape, color, bucket, month, year
-    3. Metrics: price, weight, quantity, gap
-    4. Analysis type: trend, distribution, summary
-    
-    Respond in this format:
-    ACTION: [action]
-    FILTERS: shape=[value], color=[value], bucket=[value], month=[value], year=[value]
-    METRICS: [comma-separated metrics]
-    ANALYSIS: [type]
-    
-    Example response:
-    ACTION: filter
-    FILTERS: shape=Cushion, color=FY, bucket=A
-    METRICS: price, weight
-    ANALYSIS: none
-    """
-    
-    inputs = flan_tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
-    with torch.no_grad():
-        outputs = flan_model.generate(**inputs, max_length=150, temperature=0.3)
-    
-    response = flan_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    if use_qwen and 'qwen' in models:
+        # Use Qwen for intent extraction
+        qwen_tokenizer = models['qwen']['tokenizer']
+        qwen_model = models['qwen']['model']
+        
+        messages = [
+            {"role": "system", "content": "You are extracting structured information from diamond inventory queries."},
+            {"role": "user", "content": f"""Extract the intent and filters from this diamond inventory query:
+Query: "{query}"
+
+Identify:
+1. Action type: (filter/aggregate/analyze/compare)
+2. Filters: shape, color, bucket, month, year
+3. Metrics: price, weight, quantity, gap
+4. Analysis type: trend, distribution, summary
+
+Respond in EXACTLY this format:
+ACTION: [action]
+FILTERS: shape=[value], color=[value], bucket=[value], month=[value], year=[value]
+METRICS: [comma-separated metrics]
+ANALYSIS: [type]
+
+Only include filters that are explicitly mentioned. Use 'none' if not applicable."""}
+        ]
+        
+        text = qwen_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model_inputs = qwen_tokenizer([text], return_tensors="pt").to(qwen_model.device)
+        
+        with torch.no_grad():
+            generated_ids = qwen_model.generate(
+                model_inputs.input_ids,
+                max_new_tokens=150,
+                temperature=0.1,
+                do_sample=True
+            )
+        
+        generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)]
+        response = qwen_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    else:
+        # Use Flan-T5 (default)
+        flan_tokenizer = models['flan']['tokenizer']
+        flan_model = models['flan']['model']
+        
+        prompt = f"""Extract the intent and filters from this diamond inventory query:
+Query: "{query}"
+
+Identify:
+1. Action type: (filter/aggregate/analyze/compare)
+2. Filters: shape, color, bucket, month, year
+3. Metrics: price, weight, quantity, gap
+4. Analysis type: trend, distribution, summary
+
+Respond in this format:
+ACTION: [action]
+FILTERS: shape=[value], color=[value], bucket=[value], month=[value], year=[value]
+METRICS: [comma-separated metrics]
+ANALYSIS: [type]
+
+Example response:
+ACTION: filter
+FILTERS: shape=Cushion, color=FY, bucket=A
+METRICS: price, weight
+ANALYSIS: none"""
+        
+        inputs = flan_tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+        with torch.no_grad():
+            outputs = flan_model.generate(**inputs, max_length=150, temperature=0.3)
+        
+        response = flan_tokenizer.decode(outputs[0], skip_special_tokens=True)
     
     # Parse response into structured format
     intent = {
@@ -214,52 +339,71 @@ def extract_query_intent(query: str, models: dict) -> dict:
     
     return intent
 
-def process_with_tapas(query: str, df: pd.DataFrame, models: dict) -> str:
+def process_with_qwen(query: str, df: pd.DataFrame, models: dict) -> str:
     """
-    Process table question answering using TAPAS
+    Process table question answering using Qwen
     """
-    tapas_tokenizer = models['tapas']['tokenizer']
-    tapas_model = models['tapas']['model']
+    qwen_tokenizer = models['qwen']['tokenizer']
+    qwen_model = models['qwen']['model']
     
-    # Prepare a subset of data for TAPAS (it has token limits)
-    # Select relevant columns based on query
+    # Adjust data subset size based on model
+    max_rows = 100 if MODEL_CONFIG["use_large_qwen"] else 50
+    
+    # Prepare a subset of data for processing (to fit in context)
     relevant_cols = ['Product Id', 'Shape key', 'Color Key', 'Weight', 
                      'Average\nCost\n(USD)', 'Max Buying Price', 'Min Selling Price',
                      'Buckets', 'Month', 'Year', 'Max Qty', 'Min Qty']
     
     # Filter columns that exist in the dataframe
     available_cols = [col for col in relevant_cols if col in df.columns]
-    subset_df = df[available_cols].head(100)  # TAPAS has input size limitations
+    subset_df = df[available_cols].head(max_rows)
     
-    # Convert to format TAPAS expects
-    table = subset_df.astype(str).values.tolist()
+    # Convert dataframe to a readable format for the LLM
+    table_context = "Diamond Inventory Data:\n"
+    table_context += subset_df.to_string(index=False, max_rows=max_rows)
     
-    # Tokenize
-    inputs = tapas_tokenizer(
-        table=table,
-        queries=[query],
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt"
+    # Create prompt for Qwen
+    prompt = f"""You are analyzing diamond inventory data. Based on the following table data, answer the user's question accurately and concisely.
+
+Table Data:
+{table_context}
+
+User Question: {query}
+
+Please provide a specific answer based only on the data shown above. If you need to calculate something, show your work briefly."""
+    
+    # Tokenize and generate response
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant analyzing diamond inventory data."},
+        {"role": "user", "content": prompt}
+    ]
+    
+    text = qwen_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
     )
     
-    # Get predictions
+    model_inputs = qwen_tokenizer([text], return_tensors="pt").to(qwen_model.device)
+    
+    # Adjust generation parameters based on model size
+    max_new_tokens = 300 if MODEL_CONFIG["use_large_qwen"] else 200
+    
     with torch.no_grad():
-        outputs = tapas_model(**inputs)
+        generated_ids = qwen_model.generate(
+            model_inputs.input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=0.3,
+            do_sample=True
+        )
     
-    # Process outputs
-    predicted_answer_coordinates = outputs.logits.argmax(dim=-1)
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
     
-    # Extract answer from table
-    answers = []
-    for coordinates in predicted_answer_coordinates[0]:
-        if coordinates < len(table) * len(table[0]):
-            row_idx = coordinates // len(table[0])
-            col_idx = coordinates % len(table[0])
-            if row_idx < len(table) and col_idx < len(table[0]):
-                answers.append(table[row_idx][col_idx])
+    response = qwen_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
     
-    return ", ".join(answers) if answers else "No specific answer found in the data."
+    return response.strip() if response else "I couldn't find a specific answer to your question in the data."
 
 def execute_data_operation(df: pd.DataFrame, intent: dict) -> pd.DataFrame:
     """
@@ -290,9 +434,6 @@ def generate_natural_response(query: str, intent: dict, result_df: pd.DataFrame,
     """
     Generate a natural language response based on the query results
     """
-    flan_tokenizer = models['flan']['tokenizer']
-    flan_model = models['flan']['model']
-    
     # Create summary statistics
     summary = {
         'row_count': len(result_df),
@@ -302,26 +443,65 @@ def generate_natural_response(query: str, intent: dict, result_df: pd.DataFrame,
         'unique_colors': result_df['Color Key'].nunique() if 'Color Key' in result_df.columns else 0,
     }
     
-    prompt = f"""Generate a helpful response for this diamond inventory query:
-    Query: "{query}"
-    
-    Results summary:
-    - Total items found: {summary['row_count']}
-    - Average price: ${summary['avg_price']:.2f}
-    - Total weight: {summary['total_weight']:.2f}
-    - Unique shapes: {summary['unique_shapes']}
-    - Unique colors: {summary['unique_colors']}
-    
-    Applied filters: {intent['filters']}
-    
-    Provide a concise, informative response that directly answers the user's question.
-    """
-    
-    inputs = flan_tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
-    with torch.no_grad():
-        outputs = flan_model.generate(**inputs, max_length=200, temperature=0.7)
-    
-    response = flan_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    if MODEL_CONFIG["use_qwen_for_all"] and 'qwen' in models:
+        # Use Qwen for response generation
+        qwen_tokenizer = models['qwen']['tokenizer']
+        qwen_model = models['qwen']['model']
+        
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant analyzing diamond inventory data. Provide concise, informative responses."},
+            {"role": "user", "content": f"""Generate a helpful response for this diamond inventory query:
+Query: "{query}"
+
+Results summary:
+- Total items found: {summary['row_count']}
+- Average price: ${summary['avg_price']:.2f}
+- Total weight: {summary['total_weight']:.2f} carats
+- Unique shapes: {summary['unique_shapes']}
+- Unique colors: {summary['unique_colors']}
+
+Applied filters: {intent['filters']}
+
+Provide a concise, informative response that directly answers the user's question."""}
+        ]
+        
+        text = qwen_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model_inputs = qwen_tokenizer([text], return_tensors="pt").to(qwen_model.device)
+        
+        with torch.no_grad():
+            generated_ids = qwen_model.generate(
+                model_inputs.input_ids,
+                max_new_tokens=200,
+                temperature=0.7,
+                do_sample=True
+            )
+        
+        generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)]
+        response = qwen_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    else:
+        # Use Flan-T5 (fallback)
+        flan_tokenizer = models['flan']['tokenizer']
+        flan_model = models['flan']['model']
+        
+        prompt = f"""Generate a helpful response for this diamond inventory query:
+Query: "{query}"
+
+Results summary:
+- Total items found: {summary['row_count']}
+- Average price: ${summary['avg_price']:.2f}
+- Total weight: {summary['total_weight']:.2f}
+- Unique shapes: {summary['unique_shapes']}
+- Unique colors: {summary['unique_colors']}
+
+Applied filters: {intent['filters']}
+
+Provide a concise, informative response that directly answers the user's question."""
+        
+        inputs = flan_tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+        with torch.no_grad():
+            outputs = flan_model.generate(**inputs, max_length=200, temperature=0.7)
+        
+        response = flan_tokenizer.decode(outputs[0], skip_special_tokens=True)
     
     # Add data summary
     if summary['row_count'] > 0:
@@ -1226,7 +1406,11 @@ def main():
                                 st.session_state.master_df = load_data('kunmings.pkl')
                             
                             # Check query clarity
-                            is_clear, clarification = check_query_clarity(user_query, st.session_state.models)
+                            is_clear, clarification = check_query_clarity(
+                                user_query, 
+                                st.session_state.models,
+                                use_qwen=MODEL_CONFIG["use_qwen_for_all"]
+                            )
                             
                             if not is_clear:
                                 # Ask for clarification
@@ -1234,7 +1418,11 @@ def main():
                                 st.session_state.chat_history.append({"role": "assistant", "content": response})
                             else:
                                 # Extract intent
-                                intent = extract_query_intent(user_query, st.session_state.models)
+                                intent = extract_query_intent(
+                                    user_query,
+                                    st.session_state.models,
+                                    use_qwen=MODEL_CONFIG["use_qwen_for_all"]
+                                )
                                 
                                 # Execute data operation
                                 result_df = execute_data_operation(st.session_state.master_df, intent)
@@ -1243,9 +1431,9 @@ def main():
                                 if intent['action'] in ['filter', 'aggregate', 'analyze']:
                                     response = generate_natural_response(user_query, intent, result_df, st.session_state.models)
                                 else:
-                                    # Use TAPAS for specific questions
-                                    tapas_answer = process_with_tapas(user_query, result_df, st.session_state.models)
-                                    response = f"Based on the data: {tapas_answer}"
+                                    # Use Qwen for specific questions
+                                    qwen_answer = process_with_qwen(user_query, result_df, st.session_state.models)
+                                    response = f"Based on the data: {qwen_answer}"
                                 
                                 st.session_state.chat_history.append({"role": "assistant", "content": response})
                                 
