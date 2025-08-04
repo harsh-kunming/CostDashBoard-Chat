@@ -17,7 +17,7 @@ import pickle
 
 # Initialize Hugging Face setup
 # Try multiple sources for the token
-HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "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")
+HF_TOKEN = st.secrets["huggingface_token"]
 
 # Also try Streamlit secrets
 if not HF_TOKEN:
