@@ -12,416 +12,156 @@ import json
 import os
 from pathlib import Path
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import re
-from dataclasses import dataclass
-import time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import gc
 
-# Configuration for LLM
-@dataclass
-class LLMConfig:
-    # Model options that work well with transformers library:
-    # - "Qwen/Qwen2.5-7B-Instruct" (recommended, good balance)
-    # - "mistralai/Mistral-7B-Instruct-v0.2" (fast and efficient)
-    # - "meta-llama/Llama-2-7b-chat-hf" (requires HF login)
-    # - "microsoft/Phi-3-mini-4k-instruct" (smaller, faster)
-    # - "HuggingFaceH4/zephyr-7b-beta" (good for instructions)
-    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
-    tokenizer_model: str = "microsoft/Phi-3-mini-4k-instruct"  # Different model for tokenizer
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    max_new_tokens: int = 2048
-    temperature: float = 0.7
-    top_p: float = 0.9
-    # Add option to use same tokenizer as model if needed
-    use_same_tokenizer: bool = False
-    
-# Initialize LLM components
+# Initialize Phi-3 model and tokenizer
 @st.cache_resource
-def load_llm_components():
-    """Load LLM model and tokenizer with caching"""
-    config = LLMConfig()
-    
+def load_llm_model():
+    """Load the Phi-3 model and tokenizer"""
     try:
-        # Load tokenizer
-        tokenizer_name = config.model_name if config.use_same_tokenizer else config.tokenizer_model
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
-            trust_remote_code=True,
-            padding_side="left"
-        )
-        
-        # Set pad token if not present
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        # Load the main model with better error handling
+        model_name = "microsoft/Phi-3-mini-4k-instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            torch_dtype=torch.float16 if config.device == "cuda" else torch.float32,
-            device_map="auto" if config.device == "cuda" else None,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True
         )
-        
-        if config.device == "cpu":
-            model = model.to(config.device)
-        
-        return model, tokenizer, config
-        
+        if not torch.cuda.is_available():
+            model = model.to("cpu")
+        return model, tokenizer
     except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        st.info("Attempting to load alternative model...")
-        
-        # Fallback to a smaller, more compatible model
-        config.model_name = "microsoft/Phi-3-mini-4k-instruct"
-        
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name,
-            trust_remote_code=True,
-            padding_side="left"
-        )
-        
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            torch_dtype=torch.float16 if config.device == "cuda" else torch.float32,
-            device_map="auto" if config.device == "cuda" else None,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
-        
-        if config.device == "cpu":
-            model = model.to(config.device)
-        
-        return model, tokenizer, config
+        st.error(f"Error loading model: {e}")
+        return None, None
 
-class DataAnalysisLLM:
-    """LLM-based data analysis assistant"""
+def prepare_data_context(df: pd.DataFrame, max_rows: int = 50) -> str:
+    """Prepare a summary of the dataframe for LLM context"""
+    context = f"""
+    Dataset Overview:
+    - Total rows: {len(df)}
+    - Columns: {', '.join(df.columns.tolist())}
     
-    def __init__(self, model, tokenizer, config):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.config = config
-        self.conversation_history = []
-        
-    def prepare_data_context(self, df: pd.DataFrame, sample_size: int = 100) -> str:
-        """Prepare data context for LLM"""
-        # Get data info
-        context = f"""
-Data Overview:
-- Total rows: {len(df)}
-- Total columns: {len(df.columns)}
-
-Columns and types:
-{df.dtypes.to_string()}
-
-Column descriptions:
-- Product Id: Unique identifier for each product
-- Shape/Shape key: Diamond shape (Cushion, Oval, Pear, Radiant, Other)
-- Color/Color Key: Color classification (WXYZ, FLY, FY, FIY, FVY)
-- Weight: Diamond weight
-- Average Cost (USD): Average cost per unit
-- Buckets: Weight-based categorization
-- Month/Year: Time period
-- Quarter: Quarterly grouping
-- Max Qty: Maximum quantity allowed
-- Min Qty: Minimum quantity required
-- Max Buying Price: Maximum purchase price
-- Min Selling Price: Minimum selling price
-- Avg Cost Total: Total average cost (Weight * Average Cost)
-- Buying Price Avg: Average buying price weighted
-
-Unique values in key columns:
-- Shapes: {df['Shape key'].unique().tolist() if 'Shape key' in df.columns else 'N/A'}
-- Colors: {df['Color Key'].unique().tolist() if 'Color Key' in df.columns else 'N/A'}
-- Buckets: {df['Buckets'].unique().tolist() if 'Buckets' in df.columns else 'N/A'}
-- Months: {sorted(df['Month'].unique().tolist()) if 'Month' in df.columns else 'N/A'}
-- Years: {sorted(df['Year'].unique().tolist()) if 'Year' in df.columns else 'N/A'}
-
-Sample data (first {min(sample_size, len(df))} rows):
-{df.head(sample_size).to_string()}
-"""
-        return context
+    Column Types and Sample Values:
+    """
     
-    def classify_query_intent(self, query: str, data_context: str) -> Dict:
-        """Classify user query intent using LLM"""
-        prompt = f"""
-You are an AI assistant analyzing user queries about diamond inventory data. 
-
-Data Context:
-{data_context}
-
-User Query: "{query}"
-
-Analyze this query and respond with a JSON object containing:
-1. "intent": The main intent - one of ["filter", "aggregate", "analyze", "visualize", "general_info", "clarification_needed"]
-2. "clarity": Rate query clarity from 1-10 (10 being very clear)
-3. "parameters": Extract any specific parameters mentioned (filters, columns, etc.)
-4. "clarification_question": If clarity < 7, suggest a clarifying question
-5. "suggested_action": Specific action to take with the data
-
-Respond ONLY with the JSON object, no additional text.
-"""
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        unique_count = df[col].nunique()
         
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(self.config.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.3,
-                do_sample=True,
-                top_p=0.9
-            )
-        
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract JSON from response
-        try:
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            else:
-                return {
-                    "intent": "clarification_needed",
-                    "clarity": 3,
-                    "parameters": {},
-                    "clarification_question": "Could you please clarify what you'd like to know about the data?",
-                    "suggested_action": "ask_clarification"
-                }
-        except:
-            return {
-                "intent": "clarification_needed",
-                "clarity": 3,
-                "parameters": {},
-                "clarification_question": "Could you please rephrase your question?",
-                "suggested_action": "ask_clarification"
-            }
-    
-    def generate_data_query(self, intent_info: Dict, df: pd.DataFrame) -> str:
-        """Generate pandas query based on intent"""
-        prompt = f"""
-You are a data analysis expert. Based on the user's intent, generate Python code to analyze the data.
-
-Intent Information:
-{json.dumps(intent_info, indent=2)}
-
-Available DataFrame columns:
-{df.columns.tolist()}
-
-Generate Python code that:
-1. Filters or analyzes the dataframe 'df' based on the intent
-2. Returns a result (filtered dataframe, aggregation, or analysis)
-3. Includes any necessary visualizations using plotly
-
-Respond with ONLY executable Python code, no explanations. The code should define a function called 'analyze_data(df)' that returns the result.
-"""
-        
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(self.config.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=1024,
-                temperature=0.3,
-                do_sample=True,
-                top_p=0.9
-            )
-        
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract code
-        code_match = re.search(r'def analyze_data\(df\):.*?(?=\n\n|\Z)', response, re.DOTALL)
-        if code_match:
-            return code_match.group()
+        if df[col].dtype in ['object', 'category']:
+            unique_vals = df[col].value_counts().head(5).index.tolist()
+            context += f"\n- {col} ({dtype}): {unique_count} unique values. Top 5: {unique_vals}"
         else:
-            # Fallback simple analysis
-            return """
-def analyze_data(df):
-    return df.describe()
-"""
+            context += f"\n- {col} ({dtype}): min={df[col].min()}, max={df[col].max()}, mean={df[col].mean():.2f}"
     
-    def generate_response(self, query: str, analysis_result, intent_info: Dict) -> str:
-        """Generate natural language response based on analysis"""
-        if isinstance(analysis_result, pd.DataFrame):
-            result_summary = f"DataFrame with {len(analysis_result)} rows and {len(analysis_result.columns)} columns"
-            if len(analysis_result) < 20:
-                result_detail = analysis_result.to_string()
-            else:
-                result_detail = f"First 10 rows:\n{analysis_result.head(10).to_string()}"
-        else:
-            result_summary = str(type(analysis_result))
-            result_detail = str(analysis_result)
+    # Add sample rows
+    context += f"\n\nSample of first {min(5, len(df))} rows:\n"
+    context += df.head(5).to_string()
+    
+    return context
+
+def generate_llm_response(model, tokenizer, prompt: str, max_length: int = 1000) -> str:
+    """Generate response from the LLM"""
+    try:
+        inputs = tokenizer.encode(prompt, return_tensors="pt", truncation=True, max_length=3500)
         
-        prompt = f"""
-You are a helpful data analysis assistant. The user asked: "{query}"
-
-Based on the analysis, here's what was found:
-Result Type: {result_summary}
-Result Details:
-{result_detail}
-
-Intent Information:
-{json.dumps(intent_info, indent=2)}
-
-Provide a clear, concise response explaining the findings. Be specific about numbers and patterns.
-If the result is a filtered dataset, mention key statistics.
-If it's an aggregation, explain what the numbers mean.
-"""
-        
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=3072).to(self.config.device)
+        if torch.cuda.is_available():
+            inputs = inputs.to("cuda")
         
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=512,
+            outputs = model.generate(
+                inputs,
+                max_length=max_length,
                 temperature=0.7,
                 do_sample=True,
-                top_p=0.9
+                top_p=0.95,
+                pad_token_id=tokenizer.eos_token_id
             )
         
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True).split("Provide a clear, concise response")[-1].strip()
-
-# Add conversation management functions
-def init_session_state():
-    """Initialize session state variables"""
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    if 'llm_assistant' not in st.session_state:
-        st.session_state.llm_assistant = None
-    if 'awaiting_clarification' not in st.session_state:
-        st.session_state.awaiting_clarification = False
-    if 'last_intent' not in st.session_state:
-        st.session_state.last_intent = None
-
-def display_chat_interface():
-    """Display chat interface for LLM interaction"""
-    st.subheader("🤖 AI Data Assistant")
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            if message["role"] == "user":
-                st.write(message["content"])
-            else:
-                st.write(message["content"])
-                if "data" in message:
-                    if isinstance(message["data"], pd.DataFrame):
-                        st.dataframe(message["data"], use_container_width=True)
-                    elif isinstance(message["data"], go.Figure):
-                        st.plotly_chart(message["data"], use_container_width=True)
-    
-    # Chat input
-    if prompt := st.chat_input("Ask about your diamond inventory data..."):
-        # Add user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Extract only the assistant's response
+        if "<|assistant|>" in response:
+            response = response.split("<|assistant|>")[-1].strip()
+        else:
+            response = response.replace(prompt, "").strip()
         
-        with st.chat_message("user"):
-            st.write(prompt)
-        
-        # Process with LLM
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing your query..."):
-                process_llm_query(prompt)
-
-def process_llm_query(query: str):
-    """Process user query with LLM"""
-    try:
-        # Load data
-        df = load_data('kunmings.pkl')
-        
-        # Get data context
-        data_context = st.session_state.llm_assistant.prepare_data_context(df, sample_size=50)
-        
-        # Classify intent
-        intent_info = st.session_state.llm_assistant.classify_query_intent(query, data_context)
-        
-        # Check if clarification needed
-        if intent_info["clarity"] < 7:
-            st.session_state.awaiting_clarification = True
-            st.session_state.last_intent = intent_info
-            
-            clarification_msg = intent_info.get("clarification_question", 
-                                               "Could you please provide more details about what you're looking for?")
-            st.write(clarification_msg)
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": clarification_msg
-            })
-            return
-        
-        # Generate and execute analysis
-        with st.spinner("Analyzing data..."):
-            code = st.session_state.llm_assistant.generate_data_query(intent_info, df)
-            
-            # Execute generated code
-            try:
-                # Create a safe execution environment
-                exec_globals = {
-                    'df': df,
-                    'pd': pd,
-                    'np': np,
-                    'go': go,
-                    'px': px,
-                    'datetime': datetime
-                }
-                
-                exec(code, exec_globals)
-                
-                if 'analyze_data' in exec_globals:
-                    result = exec_globals['analyze_data'](df)
-                else:
-                    result = "Analysis function not found in generated code."
-                
-                # Generate response
-                response = st.session_state.llm_assistant.generate_response(query, result, intent_info)
-                
-                st.write(response)
-                
-                # Display result if it's a dataframe or figure
-                if isinstance(result, pd.DataFrame):
-                    st.dataframe(result, use_container_width=True)
-                    
-                    # Add download button
-                    csv = result.to_csv(index=False)
-                    st.download_button(
-                        label="Download results as CSV",
-                        data=csv,
-                        file_name=f"llm_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
-                    )
-                elif isinstance(result, go.Figure):
-                    st.plotly_chart(result, use_container_width=True)
-                
-                # Save to messages
-                message_data = {
-                    "role": "assistant",
-                    "content": response
-                }
-                if isinstance(result, (pd.DataFrame, go.Figure)):
-                    message_data["data"] = result
-                
-                st.session_state.messages.append(message_data)
-                
-            except Exception as e:
-                error_msg = f"Error executing analysis: {str(e)}"
-                st.error(error_msg)
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": error_msg
-                })
-                
+        return response
     except Exception as e:
-        error_msg = f"Error processing query: {str(e)}"
-        st.error(error_msg)
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": error_msg
-        })
+        return f"Error generating response: {str(e)}"
 
-# File history management functions (existing code)
+def analyze_query_intent(model, tokenizer, query: str) -> Tuple[bool, str]:
+    """Analyze if the query needs clarification"""
+    prompt = f"""<|system|>
+You are an assistant that analyzes user queries about diamond inventory data. Determine if the query is clear enough to answer or needs clarification.
+
+Respond with either:
+1. "CLEAR" if the query is specific enough to answer
+2. "NEEDS_CLARIFICATION: [specific question to ask user]" if the query is too vague
+
+Examples:
+- "Show me all data" -> NEEDS_CLARIFICATION: What specific information would you like to see? For example, would you like to filter by shape, color, bucket, or see summary statistics?
+- "What's the average cost for Cushion shape diamonds in Q1?" -> CLEAR
+- "Tell me about diamonds" -> NEEDS_CLARIFICATION: What specific aspect of diamonds would you like to know? I can provide information about shapes, colors, pricing, inventory levels, or trends.
+<|user|>
+{query}
+<|assistant|>"""
+    
+    response = generate_llm_response(model, tokenizer, prompt, max_length=200)
+    
+    if "NEEDS_CLARIFICATION:" in response:
+        return False, response.replace("NEEDS_CLARIFICATION:", "").strip()
+    else:
+        return True, ""
+
+def process_data_query(model, tokenizer, query: str, df: pd.DataFrame) -> Tuple[str, Optional[pd.DataFrame]]:
+    """Process the user query against the data"""
+    data_context = prepare_data_context(df)
+    
+    prompt = f"""<|system|>
+You are a data analyst assistant working with diamond inventory data. You have access to a dataset with the following structure:
+
+{data_context}
+
+Your tasks:
+1. Understand the user's query
+2. If they want filtered data, provide the Python code to filter the dataframe (variable name is 'df')
+3. If they want analysis, provide insights based on the data
+4. Always be specific and helpful
+
+Respond in this format:
+ANALYSIS: [Your analysis or explanation]
+FILTER_CODE: [Python code to filter df if needed, or 'None']
+<|user|>
+{query}
+<|assistant|>"""
+    
+    response = generate_llm_response(model, tokenizer, prompt, max_length=800)
+    
+    # Parse the response
+    analysis = ""
+    filter_code = None
+    filtered_df = None
+    
+    if "ANALYSIS:" in response:
+        parts = response.split("FILTER_CODE:")
+        analysis = parts[0].replace("ANALYSIS:", "").strip()
+        if len(parts) > 1:
+            filter_code = parts[1].strip()
+            if filter_code and filter_code.lower() != 'none':
+                try:
+                    # Execute the filter code safely
+                    local_vars = {'df': df, 'pd': pd, 'np': np}
+                    exec(f"filtered_df = {filter_code}", {"__builtins__": {}}, local_vars)
+                    filtered_df = local_vars.get('filtered_df', None)
+                except Exception as e:
+                    analysis += f"\n\nError applying filter: {str(e)}"
+    else:
+        analysis = response
+    
+    return analysis, filtered_df
+
+# File history management functions (keep existing ones)
 def get_history_file_path():
     """Get the path for the history JSON file"""
     history_dir = Path("history")
@@ -492,7 +232,9 @@ def display_upload_history():
         st.sidebar.markdown("---")
         st.sidebar.info("No upload history available")
 
-# All existing data processing functions remain the same
+# Keep all existing functions (load_data, save_data, create_color_key, etc.)
+# ... [Include all the existing functions from the original code here] ...
+
 def load_data(file):
     # Handle different input types
     if isinstance(file, str):
@@ -833,25 +575,30 @@ def gap_analysis(max_qty,min_qty,stock_in_hand):
 
 def get_filtered_data(FILTER_MONTH,FILTE_YEAR,FILTER_SHAPE,FILTER_COLOR,FILTER_BUCKET):
     """
-    Filter data based on provided criteria
+    file : Monthly Stock Data Sheet
+    FILTER_MONTH : Month to filter
+    FILTE_YEAR : Year to filter
+    FILTER_SHAPE : Shape Key to filter
+    FILTER_COLOR : Color Key to filter
+    FILTER_BUCKET : Buckets to filter
+    FILTER_MONTHLY_VAR_COL : Column to calculate monthly variance
+    PARENT_DF : Parent DataFrame to concatenate with the monthly stock data
     """
     master_df = load_data('kunmings.pkl')
     if (type(FILTE_YEAR)==str) & (str(FILTE_YEAR).isnumeric()):
         FILTE_YEAR = int(FILTE_YEAR)
-    
     filter_data=master_df[(master_df['Month'] == FILTER_MONTH) & \
-                          (master_df['Year'] == FILTE_YEAR) & \
-                          (master_df['Shape key'] == FILTER_SHAPE) &\
-                          (master_df['Color Key'] == FILTER_COLOR) &\
-                          (master_df['Buckets'] == FILTER_BUCKET)]
-    
+                                      (master_df['Year'] == FILTE_YEAR) & \
+                                        (master_df['Shape key'] == FILTER_SHAPE) &\
+                                        (master_df['Color Key'] == FILTER_COLOR) &\
+                                        (master_df['Buckets'] == FILTER_BUCKET)]
     max_qty = filter_data['Max Qty'].max()
     min_qty = filter_data['Min Qty'].min()
     stock_in_hand = filter_data.shape[0]
     gap_analysis_op = gap_analysis(max_qty, min_qty, stock_in_hand)
     _filter_ = master_df[(master_df['Shape key'] == FILTER_SHAPE) &\
-                         (master_df['Color Key'] == FILTER_COLOR) &\
-                         (master_df['Buckets'] == FILTER_BUCKET)]
+                                        (master_df['Color Key'] == FILTER_COLOR) &\
+                                        (master_df['Buckets'] == FILTER_BUCKET)]
     try:
         max_buying_price = filter_data['Max Buying Price'].max()
         current_avg_cost = (sum(filter_data['Avg Cost Total'])/(filter_data['Weight'].sum() if filter_data['Weight'].sum() != 0 else 1))*.9
@@ -864,8 +611,8 @@ def get_summary_metrics(filter_data,Filter_Month,FILTER_SHAPE,FILTE_YEAR,FILTER_
     FILTE_YEAR = int(FILTE_YEAR)
     master_df = load_data('kunmings.pkl')
     _filter_ = master_df[(master_df['Shape key'] == FILTER_SHAPE) &\
-                         (master_df['Color Key'] == FILTER_COLOR) &\
-                         (master_df['Buckets'] == FILTER_BUCKET)]
+                                        (master_df['Color Key'] == FILTER_COLOR) &\
+                                        (master_df['Buckets'] == FILTER_BUCKET)]
     Prev_Month_Name = None
     for Month_Name, Month_Num in month_map.items():
         prev_month_num = month_map[Filter_Month]-1
@@ -873,10 +620,10 @@ def get_summary_metrics(filter_data,Filter_Month,FILTER_SHAPE,FILTE_YEAR,FILTER_
             Prev_Month_Name = Month_Name
     
     Prev_filter_data=master_df[(master_df['Month'] == Prev_Month_Name) & \
-                                (master_df['Year'] == FILTE_YEAR) & \
-                                (master_df['Shape key'] == FILTER_SHAPE) &\
-                                (master_df['Color Key'] == FILTER_COLOR) &\
-                                (master_df['Buckets'] == FILTER_BUCKET)]
+                                      (master_df['Year'] == FILTE_YEAR) & \
+                                        (master_df['Shape key'] == FILTER_SHAPE) &\
+                                        (master_df['Color Key'] == FILTER_COLOR) &\
+                                        (master_df['Buckets'] == FILTER_BUCKET)]
     try:
         if FILTER_MONTHLY_VAR_COL == 'Current Average Cost':
             FILTER_MONTHLY_VAR_COL='Buying Price Avg'
@@ -1037,7 +784,6 @@ def create_trend_visualization(master_df, selected_shape=None, selected_color=No
     elif variance_col == 'None' or variance_col == None:
         variance_col = 'Max Buying Price' # Default column
     
-    # Calculate monthly variance data
     try:
         var_analysis = monthly_variance(filtered_df, variance_col)
         
@@ -1181,11 +927,13 @@ def create_summary_charts(master_df, selected_shape, selected_color, selected_bu
         'Product Id': 'count'
     }).reset_index()
     
+    
     # Create date column for proper sorting
     summary_data['Num_Month'] = summary_data['Month'].map(month_map)
     summary_data['Date']='01'+'-'+summary_data['Num_Month'].astype(str)+'-'+summary_data['Year'].astype(str)
     summary_data['Date'] = pd.to_datetime(summary_data['Date'], format='%d-%m-%Y')
     summary_data = summary_data.sort_values('Date')
+    
     
     # Create subplots
     fig = make_subplots(
@@ -1274,35 +1022,19 @@ def main():
     st.markdown("Upload Excel files to process multiple sheets and filter data.")
     
     # Initialize session state
-    init_session_state()
-    
     if 'data_processed' not in st.session_state:
         st.session_state.data_processed = False
     if 'master_df' not in st.session_state:
         st.session_state.master_df = pd.DataFrame()
     if 'upload_history' not in st.session_state:
         st.session_state.upload_history = load_upload_history()
-    
-    # Initialize LLM if not already done
-    if st.session_state.llm_assistant is None:
-        with st.spinner("Loading AI Assistant..."):
-            try:
-                model, tokenizer, config = load_llm_components()
-                st.session_state.llm_assistant = DataAnalysisLLM(model, tokenizer, config)
-                st.success(f"Loaded model: {config.model_name}")
-            except Exception as e:
-                st.error(f"Failed to load LLM: {str(e)}")
-                st.info("""
-                **Note**: The Qwen3-30B-A3B-Instruct model requires special configuration. 
-                We're using Qwen2.5-7B-Instruct instead, which provides excellent performance.
-                
-                If you need to use the original model, please install:
-                ```bash
-                pip install transformers>=4.37.0
-                pip install qwen-vl-utils
-                ```
-                """)
-                return
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    if 'llm_model' not in st.session_state:
+        with st.spinner("Loading AI model... This may take a few moments on first run."):
+            model, tokenizer = load_llm_model()
+            st.session_state.llm_model = model
+            st.session_state.llm_tokenizer = tokenizer
     
     # Create tabs for different functionalities
     tab1, tab2 = st.tabs(["📊 Dashboard", "🤖 AI Assistant"])
@@ -1310,6 +1042,7 @@ def main():
     with tab1:
         # Sidebar for controls
         st.sidebar.header("Controls")
+        
         # File upload
         uploaded_file = st.sidebar.file_uploader(
             "Upload Excel File",
@@ -1384,10 +1117,10 @@ def main():
             filtered_df = st.session_state.master_df.copy()
             if ((selected_month != "None") & (selected_year != "None") & (selected_shape != "None") & (selected_color != "None") & (selected_bucket != "None")) :
                 filter_data,max_buying_price,current_avg_cost,gap_output,min_selling_price = get_filtered_data(selected_month,\
-                                                                                                                selected_year,\
-                                                                                                                selected_shape,\
-                                                                                                                selected_color,\
-                                                                                                                selected_bucket)
+                                                                                                                            selected_year,\
+                                                                                                                            selected_shape,\
+                                                                                                                            selected_color,\
+                                                                                                                            selected_bucket)
                 MOM_Variance,MOM_Percent_Change,MOM_QoQ_Percent_Change = get_summary_metrics(filter_data,selected_month,selected_shape,selected_year,\
                                                                                             selected_color,\
                                                                                             selected_bucket,\
@@ -1410,6 +1143,8 @@ def main():
                         st.metric("MOM Percent Change", f"{MOM_Percent_Change:.2f}%")
                     with qoq_perc:
                         st.metric("MOM QoQ Percent Change", f"{MOM_QoQ_Percent_Change:.2f}%")
+                    
+                    
                 else:
                     with GAP:
                         st.metric("Gap Analysis",value=gap_output,help=f"{'Excess' if gap_output>0 else 'Need' if gap_output < 0 else 'Enough'}")
@@ -1475,7 +1210,6 @@ def main():
                 """, unsafe_allow_html=True)
                 
                 viz_tab1, viz_tab2 = st.tabs(["📊 Variance Trends", "📈 Summary Analytics"])
-                
                 with viz_tab1:
                     if selected_variance_column != "None":
                         trend_fig = create_trend_visualization(
@@ -1503,25 +1237,23 @@ def main():
                     filter_data,
                     use_container_width=True,
                     hide_index=True
-                )
-                
+                        )
                 # Download processed data
                 st.subheader("💾 Download Filtered Data")
                 csv = filter_data.loc[:,['Product Id','Shape key','Color Key','Avg Cost Total','Min Qty','Max Qty','Buying Price Avg','Max Buying Price']].to_csv(index=False)
                 st.download_button(
-                    label="Download Filtered Data as CSV",
-                    data=csv,
-                    file_name=f"filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
+                label="Download Filtered Data as CSV",
+                data=csv,
+                file_name=f"filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
                 )
-                
                 st.subheader("💾 Download Master Data")
                 csv = filtered_df.to_csv(index=False)
                 st.download_button(
-                    label="Download Master Data as CSV",
-                    data=csv,
-                    file_name=f"processed_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
+                label="Download Master Data as CSV",
+                data=csv,
+                file_name=f"processed_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
                 )
             
             # GAP Summary Table - Show for all combinations
@@ -1536,7 +1268,7 @@ def main():
             )
             
             if not gap_summary_df.empty:
-                # Apply styling to highlight negative GAP values in red
+                # Apply styling to highlight shape gap
                 def highlight_shape_gap(row):
                     if row['GAP Value'] < 0:
                         return ['background-color: #ffebee; color: #c62828'] * len(row)
@@ -1553,7 +1285,6 @@ def main():
                             return ['background-color: #ffffba; color: #c62828'] * len(row)
                         else:
                             return [''] * len(row)
-                            
                 styled_df = gap_summary_df.style.apply(highlight_shape_gap, axis=1)
                 
                 st.dataframe(
@@ -1568,7 +1299,6 @@ def main():
                 gap_csv = gap_summary_df.loc[:,gap_summary_df_cols].to_csv(index=False)
                 gap_csv_excess = gap_summary_df[gap_summary_df['Status']=='Excess'].loc[:,gap_summary_df_cols].to_csv(index=False)
                 gap_csv_need = gap_summary_df[gap_summary_df['Status']=='Need'].loc[:,gap_summary_df_cols].to_csv(index=False)
-                
                 st.download_button(
                     label="Download GAP Summary as CSV",
                     data=gap_csv,
@@ -1578,13 +1308,13 @@ def main():
                 st.download_button(
                     label="Download GAP Excess Summary as CSV",
                     data=gap_csv_excess,
-                    file_name=f"gap_excess_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"gap_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
                 st.download_button(
                     label="Download GAP Need Summary as CSV",
                     data=gap_csv_need,
-                    file_name=f"gap_need_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"gap_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
             else:
@@ -1592,7 +1322,7 @@ def main():
                 
             if not ((selected_month != "None") & (selected_year != "None") & (selected_shape != "None") & (selected_color != "None") & (selected_bucket != "None")):
                 st.info("Please select all filter values except 'Select Variance Column' to view detailed metrics.")
-        
+            
         else:
             st.info("No data in master database. Upload an Excel file to get started!")
         
@@ -1610,28 +1340,120 @@ def main():
             st.rerun()
     
     with tab2:
-        # AI Assistant Tab
+        st.header("🤖 AI Assistant for Diamond Data Analysis")
+        
+        # Check if data is loaded
         if st.session_state.master_df.empty:
-            st.warning("Please upload data in the Dashboard tab first to use the AI Assistant.")
-        else:
+            # Try to load from pickle file
+            try:
+                st.session_state.master_df = load_data('kunmings.pkl')
+                st.success("Loaded existing diamond data from database.")
+            except:
+                st.warning("Please upload data in the Dashboard tab or ensure 'kunmings.pkl' exists.")
+                return
+        
+        # Check if model is loaded
+        if st.session_state.llm_model is None or st.session_state.llm_tokenizer is None:
+            st.error("AI model failed to load. Please check your internet connection and try refreshing the page.")
+            return
+        
+        # Chat interface
+        st.markdown("Ask me anything about your diamond inventory data!")
+        
+        # Display chat history
+        for message in st.session_state.chat_history:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+                if "data" in message and message["data"] is not None:
+                    st.dataframe(message["data"], use_container_width=True)
+        
+        # User input
+        user_query = st.chat_input("Type your question here...")
+        
+        if user_query:
+            # Add user message to chat history
+            st.session_state.chat_history.append({"role": "user", "content": user_query})
+            
+            with st.chat_message("user"):
+                st.write(user_query)
+            
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    # Check if query needs clarification
+                    is_clear, clarification = analyze_query_intent(
+                        st.session_state.llm_model,
+                        st.session_state.llm_tokenizer,
+                        user_query
+                    )
+                    
+                    if not is_clear:
+                        st.write(clarification)
+                        st.session_state.chat_history.append({
+                            "role": "assistant",
+                            "content": clarification
+                        })
+                    else:
+                        # Process the query
+                        analysis, filtered_data = process_data_query(
+                            st.session_state.llm_model,
+                            st.session_state.llm_tokenizer,
+                            user_query,
+                            st.session_state.master_df
+                        )
+                        
+                        st.write(analysis)
+                        
+                        # Display filtered data if available
+                        if filtered_data is not None and not filtered_data.empty:
+                            st.dataframe(filtered_data, use_container_width=True)
+                            
+                            # Option to download filtered data
+                            csv = filtered_data.to_csv(index=False)
+                            st.download_button(
+                                label="Download AI-filtered data as CSV",
+                                data=csv,
+                                file_name=f"ai_filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                        
+                        # Add to chat history
+                        st.session_state.chat_history.append({
+                            "role": "assistant",
+                            "content": analysis,
+                            "data": filtered_data
+                        })
+        
+        # Clear chat button
+        if st.button("Clear Chat History"):
+            st.session_state.chat_history = []
+            st.rerun()
+        
+        # Examples section
+        with st.expander("Example Questions"):
             st.markdown("""
-            Welcome to the AI Assistant! You can ask questions about your diamond inventory data using natural language.
+            Here are some example questions you can ask:
             
-            **Example queries:**
-            - "Show me all cushion diamonds with color FY"
-            - "What's the average cost for oval diamonds in bucket B1?"
-            - "How many products do we have in excess?"
-            - "Analyze the price trends for radiant diamonds"
-            - "Compare the gap analysis across different shapes"
+            **Data Exploration:**
+            - What shapes of diamonds do we have in inventory?
+            - Show me all Cushion shape diamonds with FLY color
+            - What's the average cost for Oval diamonds in bucket B1?
+            
+            **Filtering:**
+            - Filter diamonds with weight greater than 2 carats
+            - Show me all diamonds from January 2024
+            - Find diamonds with max buying price above $5000
+            
+            **Analysis:**
+            - What's the trend in average costs over the past months?
+            - Which shape has the highest average price?
+            - Calculate the total inventory value by shape
+            - What's our gap analysis for Cushion FLY diamonds?
+            
+            **Complex Queries:**
+            - Compare prices between different shapes in Q1 2024
+            - Which color-shape combination has the best margin?
+            - Show me underperforming inventory items
             """)
-            
-            # Display chat interface
-            display_chat_interface()
-            
-            # Clear chat button
-            if st.button("Clear Chat History"):
-                st.session_state.messages = []
-                st.rerun()
 
 if __name__ == "__main__":
     main()
