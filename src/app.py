@@ -73,7 +73,8 @@ def load_llm_model():
                 model_name,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map="auto" if torch.cuda.is_available() else None,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                trust_remote_code=True, 
             )
             
             st.info("Using Microsoft Phi-3 model as fallback.")
@@ -92,7 +93,8 @@ def load_llm_model():
                     model_name,
                     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                     device_map="auto" if torch.cuda.is_available() else None,
-                    low_cpu_mem_usage=True
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True, 
                 )
                 
                 st.info("Using Google Flan-T5 model as final fallback.")
