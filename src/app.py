@@ -82,7 +82,7 @@ Unique Values in Key Columns:
 - Years: {', '.join(map(str, df['Year'].unique().tolist() if 'Year' in df.columns else []))}
 - Shapes: {', '.join(df['Shape key'].unique().tolist() if 'Shape key' in df.columns else [])}
 - Colors: {', '.join(df['Color Key'].unique().tolist() if 'Color Key' in df.columns else [])}
-- Buckets: {', '.join(df['Buckets'].unique().tolist() if 'Buckets' in df.columns else [])}
+- Buckets: {', '.join(df['Bucket'].unique().tolist() if 'Bucket' in df.columns else [])}
 
 Sample Data (first {min(5, len(df))} rows):
 {df.head(min(5, len(df))).to_string()}
