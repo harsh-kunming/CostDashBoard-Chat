@@ -23,7 +23,7 @@ HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "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
 
 # Initialize the inference client with Mistral-7B-Instruct
 client = InferenceClient(
-    "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "Qwen/Qwen3-30B-A3B-Thinking-2507",
     token=HF_TOKEN
 )
 
