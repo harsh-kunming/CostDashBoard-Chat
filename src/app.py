@@ -16,6 +16,7 @@ import gc
 import warnings
 import time
 os.environ["HUGGING_FACE_HUB_TOKEN"] = "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"
+hf_token = "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"
 
 # Check transformers version and import accordingly
 try:
@@ -67,7 +68,7 @@ def load_llm_model():
                 try:
                     if model_type == "text2text":
                         from transformers import T5ForConditionalGeneration, T5Tokenizer
-                        tokenizer = T5Tokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+                        tokenizer = T5Tokenizer.from_pretrained(model_name, cache_dir=cache_dir,token=hf_token)
                         model = T5ForConditionalGeneration.from_pretrained(
                             model_name,
                             cache_dir=cache_dir,
@@ -78,7 +79,7 @@ def load_llm_model():
                         tokenizer = AutoTokenizer.from_pretrained(
                             model_name,
                             cache_dir=cache_dir,
-                            trust_remote_code=trust_remote
+                            trust_remote_code=trust_remote,token=hf_token
                         )
                         
                         # Ensure pad token is set
@@ -90,7 +91,7 @@ def load_llm_model():
                             cache_dir=cache_dir,
                             torch_dtype=torch.float32,
                             trust_remote_code=trust_remote,
-                            low_cpu_mem_usage=True
+                            low_cpu_mem_usage=True,token=hf_token
                         )
                     
                     # Move to appropriate device
