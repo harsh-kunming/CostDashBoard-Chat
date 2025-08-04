@@ -14,6 +14,8 @@ from pathlib import Path
 import torch
 import gc
 import warnings
+import time
+os.environ["HUGGING_FACE_HUB_TOKEN"] = "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"
 
 # Check transformers version and import accordingly
 try:
@@ -33,29 +35,85 @@ except ImportError as e:
 # Initialize Phi-3 model and tokenizer
 @st.cache_resource
 def load_llm_model():
-    """Load the Phi-3 model and tokenizer"""
-    try:
-        # Suppress warnings before loading model
-        import warnings
-        warnings.filterwarnings('ignore')
-        
-        model_name = "microsoft/Phi-3-mini-4k-instruct"
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        
-        # Model configuration without flash attention
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-            use_flash_attention_2=False  # Explicitly disable flash attention
-        )
-        if not torch.cuda.is_available():
-            model = model.to("cpu")
-        return model, tokenizer
-    except Exception as e:
-        st.error(f"Error loading model: {e}")
-        return None, None
+    """Load the LLM model with proper error handling and fallbacks"""
+    import time
+    import os
+    
+    # Set cache directory
+    cache_dir = "./model_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ['TRANSFORMERS_CACHE'] = cache_dir
+    os.environ['HF_HOME'] = cache_dir
+    
+    # Suppress all warnings
+    import warnings
+    warnings.filterwarnings('ignore')
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
+    # List of models to try
+    models_to_try = [
+        ("microsoft/DialoGPT-small", False, "conversational"),  # 117M params, easier to load
+        ("google/flan-t5-small", False, "text2text"),  # 77M params
+        ("distilgpt2", False, "causal")  # 82M params
+    ]
+    
+    for model_name, trust_remote, model_type in models_to_try:
+        try:
+            st.info(f"Loading {model_name}...")
+            
+            # Try loading with retries
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    if model_type == "text2text":
+                        from transformers import T5ForConditionalGeneration, T5Tokenizer
+                        tokenizer = T5Tokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+                        model = T5ForConditionalGeneration.from_pretrained(
+                            model_name,
+                            cache_dir=cache_dir,
+                            torch_dtype=torch.float32,
+                            low_cpu_mem_usage=True
+                        )
+                    else:
+                        tokenizer = AutoTokenizer.from_pretrained(
+                            model_name,
+                            cache_dir=cache_dir,
+                            trust_remote_code=trust_remote
+                        )
+                        
+                        # Ensure pad token is set
+                        if tokenizer.pad_token is None:
+                            tokenizer.pad_token = tokenizer.eos_token
+                        
+                        model = AutoModelForCausalLM.from_pretrained(
+                            model_name,
+                            cache_dir=cache_dir,
+                            torch_dtype=torch.float32,
+                            trust_remote_code=trust_remote,
+                            low_cpu_mem_usage=True
+                        )
+                    
+                    # Move to appropriate device
+                    if torch.cuda.is_available():
+                        model = model.cuda()
+                    
+                    st.success(f"Successfully loaded {model_name}")
+                    return model, tokenizer
+                    
+                except Exception as e:
+                    if "429" in str(e) and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5
+                        st.warning(f"Rate limited. Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        raise e
+                        
+        except Exception as e:
+            st.warning(f"Failed to load {model_name}: {str(e)[:100]}...")
+            continue
+    
+    st.error("Unable to load any model. Please check your internet connection or try again later.")
+    return None, None
 
 def prepare_data_context(df: pd.DataFrame, max_rows: int = 50) -> str:
     """Prepare a summary of the dataframe for LLM context"""
@@ -84,28 +142,44 @@ def prepare_data_context(df: pd.DataFrame, max_rows: int = 50) -> str:
     return context
 
 def generate_llm_response(model, tokenizer, prompt: str, max_length: int = 1000) -> str:
-    """Generate response from the LLM"""
+    """Generate response from the LLM - handles different model types"""
     try:
-        inputs = tokenizer.encode(prompt, return_tensors="pt", truncation=True, max_length=3500)
+        # Check model type
+        model_class = model.__class__.__name__
         
-        if torch.cuda.is_available():
-            inputs = inputs.to("cuda")
-        
-        with torch.no_grad():
+        if "T5" in model_class:
+            # T5 models use different generation
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+            if torch.cuda.is_available():
+                inputs = {k: v.cuda() for k, v in inputs.items()}
+            
             outputs = model.generate(
-                inputs,
+                **inputs,
                 max_length=max_length,
                 temperature=0.7,
                 do_sample=True,
-                top_p=0.95,
-                pad_token_id=tokenizer.eos_token_id
+                top_p=0.95
             )
-        
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Extract only the assistant's response
-        if "<|assistant|>" in response:
-            response = response.split("<|assistant|>")[-1].strip()
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         else:
+            # GPT-style models
+            inputs = tokenizer.encode(prompt, return_tensors="pt", truncation=True, max_length=1000)
+            
+            if torch.cuda.is_available():
+                inputs = inputs.to("cuda")
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    inputs,
+                    max_length=max_length,
+                    temperature=0.7,
+                    do_sample=True,
+                    top_p=0.95,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Remove the prompt from response
             response = response.replace(prompt, "").strip()
         
         return response
