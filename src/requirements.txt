@@ -9,3 +9,6 @@ torch>=2.1.0
 huggingface-hub
 requests
 pathlib
+accelerate
+sentencepiece
+protobuf
