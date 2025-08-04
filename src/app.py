@@ -36,7 +36,7 @@ import re
 #     )
     
 #     return tokenizer, model
-hf_token = "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"
+hf_token = st.secrets["hf_token"]
 @st.cache_resource
 def load_llm_model():
     
