@@ -11,4 +11,4 @@ requests
 pathlib
 accelerate
 protobuf
-qwen-vl-utils
+
