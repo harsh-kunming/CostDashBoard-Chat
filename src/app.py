@@ -12,7 +12,7 @@ import json
 import os
 from pathlib import Path
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, T5Tokenizer, T5ForConditionalGeneration
 import gc
 
 # Initialize session state for chat
@@ -29,42 +29,78 @@ if 'original_query' not in st.session_state:
 
 @st.cache_resource
 def load_llm_model():
-    """Load the Qwen LLM model and tokenizer"""
+    """Load the LLM model and tokenizer"""
     try:
-        model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        # Try to load Qwen model with proper configuration
+        model_name = "Qwen/Qwen2-7B-Instruct"
         
-        # Load tokenizer
+        # Load tokenizer with trust_remote_code
         tokenizer = AutoTokenizer.from_pretrained(
             model_name,
             trust_remote_code=True,
-            padding_side='left'
+            use_fast=True
         )
+        
+        # Set padding token if not set
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         
         # Load model with appropriate settings for memory efficiency
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
         
         return tokenizer, model
     except Exception as e:
-        st.error(f"Error loading LLM model: {str(e)}")
-        # Fallback to a smaller model if needed
+        st.warning(f"Could not load Qwen model: {str(e)}. Trying alternative model...")
+        
+        # Fallback to a more standard model
         try:
-            model_name = "Qwen/Qwen2.5-7B-Instruct"
+            # Use a smaller, more accessible model as fallback
+            model_name = "microsoft/Phi-3-mini-4k-instruct"
+            
             tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            # Set padding token if not set
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float16,
-                device_map="auto",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None,
                 low_cpu_mem_usage=True
             )
+            
+            st.info("Using Microsoft Phi-3 model as fallback.")
             return tokenizer, model
-        except:
-            return None, None
+            
+        except Exception as e2:
+            st.error(f"Error loading fallback model: {str(e2)}")
+            
+            # Final fallback to a very small model
+            try:
+                model_name = "google/flan-t5-large"
+                from transformers import T5Tokenizer, T5ForConditionalGeneration
+                
+                tokenizer = T5Tokenizer.from_pretrained(model_name)
+                model = T5ForConditionalGeneration.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    device_map="auto" if torch.cuda.is_available() else None,
+                    low_cpu_mem_usage=True
+                )
+                
+                st.info("Using Google Flan-T5 model as final fallback.")
+                return tokenizer, model
+                
+            except Exception as e3:
+                st.error(f"Could not load any model. Please check your environment: {str(e3)}")
+                return None, None
 
 def prepare_data_context(df: pd.DataFrame, max_rows: int = 100) -> str:
     """Prepare data context for LLM"""
@@ -82,7 +118,7 @@ Unique Values in Key Columns:
 - Years: {', '.join(map(str, df['Year'].unique().tolist() if 'Year' in df.columns else []))}
 - Shapes: {', '.join(df['Shape key'].unique().tolist() if 'Shape key' in df.columns else [])}
 - Colors: {', '.join(df['Color Key'].unique().tolist() if 'Color Key' in df.columns else [])}
-- Buckets: {', '.join(df['Bucket'].unique().tolist() if 'Bucket' in df.columns else [])}
+- Buckets: {', '.join(df['Buckets'].unique().tolist() if 'Buckets' in df.columns else [])}
 
 Sample Data (first {min(5, len(df))} rows):
 {df.head(min(5, len(df))).to_string()}
@@ -96,6 +132,9 @@ def generate_llm_response(query: str, data_context: str, tokenizer, model) -> Tu
     """Generate response from LLM"""
     if tokenizer is None or model is None:
         return "LLM model not loaded. Please check your connection and try again.", False
+    
+    # Check if it's a T5 model (different generation approach)
+    is_t5_model = "t5" in model.config._name_or_path.lower()
     
     # Construct the prompt
     system_prompt = """You are a data analysis assistant for a Yellow Diamond inventory system. You help users analyze their diamond inventory data.
@@ -126,25 +165,54 @@ Respond with ONLY one of these:
 
 Consider the available data columns and context when deciding."""
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"{clarification_check_prompt}\n\nData Context:\n{data_context[:2000]}"}
-    ]
-    
-    # Generate clarification check
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=100,
-            temperature=0.1,
-            do_sample=True,
-            top_p=0.95
-        )
-    
-    clarification_response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+    if is_t5_model:
+        # T5 model approach
+        prompt = f"{system_prompt}\n\nData Context:\n{data_context[:1000]}\n\n{clarification_check_prompt}"
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+        
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=100,
+                temperature=0.1,
+                do_sample=True,
+                top_p=0.95
+            )
+        
+        clarification_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    else:
+        # Chat model approach
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{clarification_check_prompt}\n\nData Context:\n{data_context[:2000]}"}
+        ]
+        
+        # Try to use chat template if available
+        try:
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except:
+            # Fallback to simple concatenation
+            text = f"{system_prompt}\n\nUser: {clarification_check_prompt}\n\nData Context:\n{data_context[:2000]}\n\nAssistant:"
+        
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
+        
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=100,
+                temperature=0.1,
+                do_sample=True,
+                top_p=0.95,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        clarification_response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
     
     # Check if clarification is needed
     if clarification_response.strip().startswith("VAGUE:"):
@@ -165,24 +233,52 @@ Provide:
 3. Any recommendations if applicable
 4. If filtering is needed, specify exact filter conditions"""
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": analysis_prompt}
-    ]
-    
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=1024,
-            temperature=0.7,
-            do_sample=True,
-            top_p=0.95
-        )
-    
-    response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+    if is_t5_model:
+        # T5 model approach
+        prompt = f"{system_prompt}\n\n{analysis_prompt}"
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+        
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.95
+            )
+        
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    else:
+        # Chat model approach
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": analysis_prompt}
+        ]
+        
+        try:
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except:
+            text = f"{system_prompt}\n\nUser: {analysis_prompt}\n\nAssistant:"
+        
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
+        
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=1024,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.95,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
     
     # Clean up memory
     gc.collect()
