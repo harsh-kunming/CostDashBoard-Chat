@@ -17,7 +17,7 @@ import pickle
 
 # Initialize Hugging Face setup
 # Try multiple sources for the token
-HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "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")
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "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")
 
 # Also try Streamlit secrets
 if not HF_TOKEN:
@@ -30,11 +30,11 @@ if not HF_TOKEN:
 # Alternative: Use the free Inference API without token for testing
 if not HF_TOKEN:
     # Use the serverless inference API (may have rate limits)
-    API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+    API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen3-30B-A3B-Instruct-2507"
     headers = {}
 else:
     # Use authenticated API
-    API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+    API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen3-30B-A3B-Instruct-2507"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
 
 # File history management functions
