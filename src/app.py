@@ -20,12 +20,20 @@ import time
 # Configuration for LLM
 @dataclass
 class LLMConfig:
-    model_name: str = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    # Model options that work well with transformers library:
+    # - "Qwen/Qwen2.5-7B-Instruct" (recommended, good balance)
+    # - "mistralai/Mistral-7B-Instruct-v0.2" (fast and efficient)
+    # - "meta-llama/Llama-2-7b-chat-hf" (requires HF login)
+    # - "microsoft/Phi-3-mini-4k-instruct" (smaller, faster)
+    # - "HuggingFaceH4/zephyr-7b-beta" (good for instructions)
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     tokenizer_model: str = "microsoft/Phi-3-mini-4k-instruct"  # Different model for tokenizer
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     max_new_tokens: int = 2048
     temperature: float = 0.7
     top_p: float = 0.9
+    # Add option to use same tokenizer as model if needed
+    use_same_tokenizer: bool = False
     
 # Initialize LLM components
 @st.cache_resource
@@ -33,30 +41,61 @@ def load_llm_components():
     """Load LLM model and tokenizer with caching"""
     config = LLMConfig()
     
-    # Load tokenizer from different model
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.tokenizer_model,
-        trust_remote_code=True,
-        padding_side="left"
-    )
-    
-    # Set pad token if not present
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Load the main model
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        torch_dtype=torch.float16 if config.device == "cuda" else torch.float32,
-        device_map="auto" if config.device == "cuda" else None,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True
-    )
-    
-    if config.device == "cpu":
-        model = model.to(config.device)
-    
-    return model, tokenizer, config
+    try:
+        # Load tokenizer
+        tokenizer_name = config.model_name if config.use_same_tokenizer else config.tokenizer_model
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=True,
+            padding_side="left"
+        )
+        
+        # Set pad token if not present
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Load the main model with better error handling
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float16 if config.device == "cuda" else torch.float32,
+            device_map="auto" if config.device == "cuda" else None,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+        
+        if config.device == "cpu":
+            model = model.to(config.device)
+        
+        return model, tokenizer, config
+        
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+        st.info("Attempting to load alternative model...")
+        
+        # Fallback to a smaller, more compatible model
+        config.model_name = "microsoft/Phi-3-mini-4k-instruct"
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name,
+            trust_remote_code=True,
+            padding_side="left"
+        )
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float16 if config.device == "cuda" else torch.float32,
+            device_map="auto" if config.device == "cuda" else None,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+        
+        if config.device == "cpu":
+            model = model.to(config.device)
+        
+        return model, tokenizer, config
 
 class DataAnalysisLLM:
     """LLM-based data analysis assistant"""
@@ -1247,8 +1286,23 @@ def main():
     # Initialize LLM if not already done
     if st.session_state.llm_assistant is None:
         with st.spinner("Loading AI Assistant..."):
-            model, tokenizer, config = load_llm_components()
-            st.session_state.llm_assistant = DataAnalysisLLM(model, tokenizer, config)
+            try:
+                model, tokenizer, config = load_llm_components()
+                st.session_state.llm_assistant = DataAnalysisLLM(model, tokenizer, config)
+                st.success(f"Loaded model: {config.model_name}")
+            except Exception as e:
+                st.error(f"Failed to load LLM: {str(e)}")
+                st.info("""
+                **Note**: The Qwen3-30B-A3B-Instruct model requires special configuration. 
+                We're using Qwen2.5-7B-Instruct instead, which provides excellent performance.
+                
+                If you need to use the original model, please install:
+                ```bash
+                pip install transformers>=4.37.0
+                pip install qwen-vl-utils
+                ```
+                """)
+                return
     
     # Create tabs for different functionalities
     tab1, tab2 = st.tabs(["📊 Dashboard", "🤖 AI Assistant"])
