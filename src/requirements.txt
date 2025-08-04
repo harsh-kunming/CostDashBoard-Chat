@@ -10,4 +10,4 @@ requests
 pathlib
 accelerate
 protobuf
-
+huggingface-hub
