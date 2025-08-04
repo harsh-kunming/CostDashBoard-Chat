@@ -16,26 +16,26 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import re
 
 # Initialize LLM model and tokenizer
-def load_llm_model():
-    """Load the Mistral model and tokenizer from Hugging Face"""
-    model_name = "mistralai/Mistral-7B-Instruct-v0.2"
+# def load_llm_model():
+#     """Load the Mistral model and tokenizer from Hugging Face"""
+#     model_name = "mistralai/Mistral-7B-Instruct-v0.2"
     
-    # Pass token to both tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, 
-        trust_remote_code=True,
-        token=hf_token  # Make sure hf_token is defined
-    )
+#     # Pass token to both tokenizer and model
+#     tokenizer = AutoTokenizer.from_pretrained(
+#         model_name, 
+#         trust_remote_code=True,
+#         token=hf_token  # Make sure hf_token is defined
+#     )
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True,
-        token=hf_token  # Add token here too!
-    )
+#     model = AutoModelForCausalLM.from_pretrained(
+#         model_name,
+#         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+#         device_map="auto" if torch.cuda.is_available() else None,
+#         trust_remote_code=True,
+#         token=hf_token  # Add token here too!
+#     )
     
-    return tokenizer, model
+#     return tokenizer, model
 hf_token = "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"
 @st.cache_resource
 def load_llm_model():
